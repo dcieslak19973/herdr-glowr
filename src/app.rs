@@ -167,6 +167,11 @@ pub struct App {
     /// Set by `start_edit` when it opens the composer from the comments-list overlay, so
     /// `submit_comment`/`cancel_comment` return there instead of `Mode::Browse`.
     resume_list: bool,
+    /// Which doc pane the file list's `j`/`k` loads a selection into — the last doc pane
+    /// `cycle_focus` moved focus onto (`DocA` → `0`, `DocB` → `1`); reset to `0` whenever
+    /// split mode is left, so a list selection never silently lands in a hidden pane.
+    /// Defaults to `0` so single-pane browsing is unaffected.
+    list_target_pane: usize,
 }
 
 /// `App`'s defaults for a session that has not yet loaded a repo: an empty file list, a
@@ -197,6 +202,7 @@ impl Default for App {
             comments_signature: 0,
             show_ignored: false,
             resume_list: false,
+            list_target_pane: 0,
         }
     }
 }
@@ -442,6 +448,7 @@ impl App {
             comments_signature,
             show_ignored: cfg.show_ignored(),
             resume_list: false,
+            list_target_pane: 0,
         };
         if let Some(path) = app.files.first().map(|f| f.path.clone()) {
             app.load_pane(0, &path);
@@ -451,21 +458,31 @@ impl App {
 
     // ---- focus & layout --------------------------------------------------------------
 
-    /// `Tab`: `List` → `DocA` → `DocB` (only while `split`) → `List`.
+    /// `Tab`: `List` → `DocA` → `DocB` (only while `split`) → `List`. Moving onto a doc pane
+    /// remembers it as `list_target_pane` — where the file list's `j`/`k` loads next.
     pub fn cycle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::List => Focus::DocA,
             Focus::DocA if self.split => Focus::DocB,
             Focus::DocA | Focus::DocB => Focus::List,
         };
+        match self.focus {
+            Focus::DocA => self.list_target_pane = 0,
+            Focus::DocB => self.list_target_pane = 1,
+            Focus::List => {}
+        }
     }
 
-    /// Flip split-doc mode. Leaving split while `DocB` is focused falls back to `DocA` —
-    /// `DocB` is never a valid focus target while its pane is hidden.
+    /// Flip split-doc mode. Leaving split while `DocB` is focused falls back to `DocA`, and
+    /// resets `list_target_pane` to `0` — `DocB` is never a valid focus, or file-list load,
+    /// target while its pane is hidden.
     pub fn toggle_split(&mut self) {
         self.split = !self.split;
-        if !self.split && self.focus == Focus::DocB {
-            self.focus = Focus::DocA;
+        if !self.split {
+            if self.focus == Focus::DocB {
+                self.focus = Focus::DocA;
+            }
+            self.list_target_pane = 0;
         }
     }
 
@@ -491,14 +508,16 @@ impl App {
         self.select_file(clamp_cursor(self.file_cursor, delta, self.files.len()), area);
     }
 
-    /// Select file `idx`, load it into `focus_pane()` (`0` unless `focus` is exactly
-    /// `Focus::DocB`), and reveal the cursor in the file list.
+    /// Select file `idx`, load it into `list_target_pane` (the doc pane `cycle_focus` last
+    /// moved focus onto — `DocA` unless the reviewer `Tab`bed onto `DocB` first), and reveal
+    /// the cursor in the file list. This is how a split-mode reviewer gets a *different* doc
+    /// into each pane: `Tab` to `DocB`, `Tab` back to the list, then `j`/`k` a file — it loads
+    /// into `DocB`, not `DocA`.
     fn select_file(&mut self, idx: usize, area: Rect) {
         let Some(entry) = self.files.get(idx) else { return };
         self.file_cursor = idx;
         let path = entry.path.clone();
-        let pane = self.focus_pane();
-        self.load_pane(pane, &path);
+        self.load_pane(self.list_target_pane, &path);
         self.reveal_file_cursor(area);
     }
 
