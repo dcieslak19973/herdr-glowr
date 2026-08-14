@@ -39,6 +39,17 @@ fn renders_comment_card_under_block() {
     assert!(buffer_to_string(term.backend().buffer()).contains("clarify"));
 }
 
+#[test]
+fn split_renders_two_docs() {
+    let mut app = App::for_test_with_path("# AAA\n", Some("a.md"));
+    app.load_into_test(1, "b.md", "# BBB\n"); // put a second doc in pane B
+    app.split = true;
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| ui::render(f, &app)).unwrap();
+    let t = buffer_to_string(term.backend().buffer());
+    assert!(t.contains("AAA") && t.contains("BBB"));
+}
+
 /// The style of the first cell of `needle`'s first occurrence in `buf`, scanning row by
 /// row (ascii-only callers, so byte offset == column offset). `None` if `needle` never
 /// appears — lets a style assertion also prove the text was actually painted.

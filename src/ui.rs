@@ -1,11 +1,13 @@
-//! Rendering the single-doc view: header, body (doc + file list), and footer.
+//! Rendering the doc view(s): header, body (doc pane(s) + file list), and footer.
 //!
-//! The layout is a one-row header, a body split into the rendered doc (left) and the
-//! markdown file list (right), and a one-row footer action bar. While composing, the
-//! comment box is spliced inline into the doc under the selected block; the
-//! comments-list overlay is drawn on top when open. Rendering reads `App` only; all
-//! state changes live in `app.rs`. Split-doc rendering (two docs side by side) is
-//! Task 9's job — [`render`] always paints `app.docs[0]`.
+//! The layout is a one-row header, a body split into the rendered doc region (left) and the
+//! markdown file list (right), and a one-row footer action bar. In split mode (`app.split`)
+//! the doc region itself divides into two side-by-side panes, `docs[0]` and `docs[1]`, each
+//! with its own focus highlight, cursor, scroll, and selection — [`doc_rect`] is the one
+//! place that computes which half a pane paints into, so every geometry helper below and
+//! [`render`] agree by construction (`G5`). While composing, the comment box is spliced
+//! inline into the doc pane under the selected block; the comments-list overlay is drawn on
+//! top when open. Rendering reads `App` only; all state changes live in `app.rs`.
 
 use std::rc::Rc;
 
@@ -26,7 +28,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     let p = panes(area, app.list_pct);
 
     render_header(frame, app, p.header);
-    render_doc_view(frame, app, 0, app.focus == Focus::DocA, p.doc);
+    render_doc_view(frame, app, 0, app.focus == Focus::DocA, doc_rect(area, app.list_pct, app.split, 0));
+    if app.split {
+        render_doc_view(frame, app, 1, app.focus == Focus::DocB, doc_rect(area, app.list_pct, app.split, 1));
+    }
     render_file_list(frame, app, p.files);
     render_footer(frame, app, p.footer);
 
@@ -62,6 +67,19 @@ fn panes(area: Rect, list_pct: u16) -> Panes {
     ])
     .split(body);
     Panes { header: rows[0], doc: split[0], files: split[1], body, footer: rows[2] }
+}
+
+/// The `pane`'s doc rect: the whole doc region when not split, else its left (`pane == 0`)
+/// or right (`pane == 1`) half. One place computes the split, so [`render`]'s paint and
+/// every geometry helper below agree on where each pane's content lives (`G5`).
+fn doc_rect(area: Rect, list_pct: u16, split: bool, pane: usize) -> Rect {
+    let doc_area = panes(area, list_pct).doc;
+    if !split {
+        return doc_area;
+    }
+    let halves =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(doc_area);
+    halves[pane.min(1)]
 }
 
 /// The whole body band (between the header and footer), for divider hit-testing.
@@ -110,15 +128,20 @@ pub fn in_files_pane(area: Rect, list_pct: u16, col: u16, row: u16) -> bool {
 /// render row, including any spliced comment cards — see [`doc_row_heights`]) and
 /// `doc_scroll` reproduce the painted window, so a click on a card or a wrapped row maps to
 /// the right render row.
+// Eight independent geometry inputs a click hit-test needs — grouping them into a struct
+// would just move the same fields one level out, not reduce the coupling.
+#[allow(clippy::too_many_arguments)]
 pub fn hit_doc(
     area: Rect,
     list_pct: u16,
+    split: bool,
+    pane: usize,
     col: u16,
     row: u16,
     heights: &[usize],
     doc_scroll: usize,
 ) -> Option<usize> {
-    let inner = inner_rect(panes(area, list_pct).doc);
+    let inner = inner_rect(doc_rect(area, list_pct, split, pane));
     if !contains(inner, col, row) {
         return None;
     }
@@ -133,12 +156,12 @@ pub fn hit_doc(
     None
 }
 
-/// The number of doc rows visible in the doc pane, used to clamp the scroll.
-pub fn doc_viewport_height(area: Rect, list_pct: u16) -> usize {
-    inner_rect(panes(area, list_pct).doc).height as usize
+/// The number of doc rows visible in `pane`'s doc, used to clamp its scroll.
+pub fn doc_viewport_height(area: Rect, list_pct: u16, split: bool, pane: usize) -> usize {
+    inner_rect(doc_rect(area, list_pct, split, pane)).height as usize
 }
 
-/// The display height of each row `markdown::layout_rows` produces for `app.docs[0]`: 1,
+/// The display height of each row `markdown::layout_rows` produces for `app.docs[pane]`: 1,
 /// plus any spliced comment-card lines when the row is the last one of a block that has a
 /// comment. Shares `layout_rows` and `comment_cards` with [`render_doc_view`], so what this
 /// measures is exactly what gets painted — scroll-clamping and hit-testing can't desync from
@@ -147,15 +170,15 @@ pub fn doc_viewport_height(area: Rect, list_pct: u16) -> usize {
 /// This does *not* account for an open inline composer: while `render_doc_view` is composing
 /// on this pane, it replaces the scrolled window with a fixed above/box/below split anchored
 /// to the selected block (see its "Composing:" branch), which these row heights don't model.
-/// Callers (Task 9's click hit-testing) must not route through `hit_doc`/`doc_row_heights`
-/// while `app.mode` is `Mode::Composing` for the doc's pane — the composer has no click
-/// target of its own yet.
-pub fn doc_row_heights(app: &App, area: Rect) -> Vec<usize> {
-    let width = inner_rect(panes(area, app.list_pct).doc).width as usize;
+/// Callers (click hit-testing) must not route through `hit_doc`/`doc_row_heights` while
+/// `app.mode` is `Mode::Composing` for the doc's pane — the composer has no click target of
+/// its own yet.
+pub fn doc_row_heights(app: &App, area: Rect, pane: usize) -> Vec<usize> {
+    let width = inner_rect(doc_rect(area, app.list_pct, app.split, pane)).width as usize;
     let p = &app.palette;
-    let doc_pane = &app.docs[0];
+    let doc_pane = &app.docs[pane];
     let rows = markdown::layout_rows(&doc_pane.doc, width, app.wrap);
-    let cards = app.comment_cards(0);
+    let cards = app.comment_cards(pane);
     rows.iter()
         .enumerate()
         .map(|(i, row)| {
@@ -185,10 +208,10 @@ pub fn composer_content_width(width: usize) -> usize {
     width.saturating_sub(2).max(1)
 }
 
-/// The doc pane's inner content width for the full terminal `area`, so the event loop can
+/// The `pane`'s doc inner content width for the full terminal `area`, so `on_key` can
 /// reserve the comment box without a `Frame` (mirrors [`doc_viewport_height`]).
-pub fn doc_inner_width(area: Rect, list_pct: u16) -> usize {
-    inner_rect(panes(area, list_pct).doc).width as usize
+pub fn doc_inner_width(area: Rect, list_pct: u16, split: bool, pane: usize) -> usize {
+    inner_rect(doc_rect(area, list_pct, split, pane)).width as usize
 }
 
 /// The header band: `glowr`, then a right-aligned `[ Send (N) ]` button naming exactly the
@@ -581,6 +604,17 @@ fn caret_rowcol(rows: &[(usize, String)], caret: usize) -> (usize, usize) {
     let row = rows.iter().rposition(|(start, _)| *start <= caret).unwrap_or(0);
     let (start, text) = &rows[row];
     (row, (caret - start).min(text.chars().count()))
+}
+
+/// The new caret char index after moving up (`down == false`) or down one wrapped row within
+/// the comment box, keeping the column where the target row allows. For `on_key`'s composer
+/// `↑`/`↓` handling.
+pub fn caret_vertical(input: &str, caret: usize, content_w: usize, down: bool) -> usize {
+    let rows = box_rows(input, content_w);
+    let (row, col) = caret_rowcol(&rows, caret);
+    let target = if down { (row + 1).min(rows.len() - 1) } else { row.saturating_sub(1) };
+    let (start, text) = &rows[target];
+    start + col.min(text.chars().count())
 }
 
 /// The key glyph and label for a footer action; an empty label renders the glyph alone. The

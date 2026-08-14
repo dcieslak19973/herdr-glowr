@@ -9,15 +9,20 @@
 //! persisted through.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
 
-use crate::comments::{Author, Store};
-use crate::file_list::FileEntry;
+use crate::comments::{Author, Status, Store};
+use crate::config::{self, PluginConfig};
+use crate::export::{Agent, Clipboard, ExportTarget, format_all};
+use crate::file_list::{self, FileEntry};
+use crate::highlight::Highlighter;
 use crate::logln;
-use crate::markdown::{Block, Document};
+use crate::markdown::{self, Block, Document};
 use crate::model::{Comment, CommentStore};
 use crate::theme::{self, Palette};
 use crate::ui;
@@ -106,7 +111,15 @@ pub enum Tier {
 /// The file-list pane's default width, as a percentage of the terminal width.
 const DEFAULT_LIST_PCT: u16 = 32;
 
+/// The file-list pane width's resize bounds — `[`/`]` clamp within these so a drag or
+/// repeated keypress can't collapse either pane to nothing.
+const MIN_LIST_PCT: u16 = 15;
+const MAX_LIST_PCT: u16 = 60;
+
 /// The full state of a viewer session.
+// `split`/`wrap`/`should_quit`/`show_ignored`/`resume_list` are independent toggles, not a
+// state machine in disguise, so the excessive-bools lint does not apply (mirrors reviewr).
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct App {
     /// The worktree root every relative path (files, comments) is resolved against.
@@ -136,12 +149,24 @@ pub struct App {
     pub mode: Mode,
     /// Text of the comment currently being composed (`Mode::Composing`).
     pub input: String,
-    /// Caret position within `input`, in bytes.
+    /// Caret position within `input`, as a char index (not a byte offset) — matches the
+    /// composer's char-wise editing (`ui::box_rows`/`caret_rowcol`).
     pub caret: usize,
     /// Set once the user has asked to quit.
     pub should_quit: bool,
     /// The active palette every renderer paints from.
     pub palette: Palette,
+    /// The syntax highlighter for the active theme; rebuilt on a theme change so a doc
+    /// loaded afterward (`load_pane`) renders with matching colors.
+    highlighter: Highlighter,
+    /// The last `Store::signature()` this session observed; `check_comment_store` (the poll
+    /// tick) re-syncs `comments` from disk only when it has moved.
+    comments_signature: u64,
+    /// Whether gitignored markdown files are included in `files`, from the plugin config.
+    show_ignored: bool,
+    /// Set by `start_edit` when it opens the composer from the comments-list overlay, so
+    /// `submit_comment`/`cancel_comment` return there instead of `Mode::Browse`.
+    resume_list: bool,
 }
 
 /// `App`'s defaults for a session that has not yet loaded a repo: an empty file list, a
@@ -150,6 +175,7 @@ pub struct App {
 /// initialization (repo scan, config, theme override) replaces it.
 impl Default for App {
     fn default() -> Self {
+        let theme = theme::resolve(None);
         App {
             repo: PathBuf::new(),
             files: Vec::new(),
@@ -166,7 +192,11 @@ impl Default for App {
             input: String::new(),
             caret: 0,
             should_quit: false,
-            palette: theme::resolve(None).palette,
+            palette: theme.palette,
+            highlighter: Highlighter::new(theme.syntax),
+            comments_signature: 0,
+            show_ignored: false,
+            resume_list: false,
         }
     }
 }
@@ -250,13 +280,6 @@ impl App {
             logln!("app: failed to persist comment: {}", e.0);
         }
         self.comments.add(comment);
-    }
-
-    /// Handle one key press, mutating state. `q` requests a quit.
-    fn on_key(&mut self, code: KeyCode) {
-        if code == KeyCode::Char('q') {
-            self.should_quit = true;
-        }
     }
 
     /// The doc pane index `focus` currently points at: `Focus::DocB` (Task 9's split mode)
@@ -376,6 +399,650 @@ impl App {
     }
 }
 
+/// Task 9: focus/layout, file loading, the comment composer's caret editor, comment
+/// actions (edit/delete/resolve/jump/list), export, and the poll-tick refresh — everything
+/// `on_key` and `run_tui` drive. Still terminal-free: `on_key` takes a plain `KeyEvent` and
+/// the frame `Rect` (for composer-width and scroll-reveal geometry only), never a `Frame` or
+/// a `crossterm::Event`.
+impl App {
+    /// Build the initial session for `run_tui`: the cwd as the repo root, its comment store
+    /// (`None` when it is not a git worktree), the configured theme, a fresh markdown scan,
+    /// and the newest file loaded into the primary pane (no path argument — see
+    /// `docs/superpowers/specs/2026-08-13-herdr-glowr-design.md`, "no argument ... the
+    /// newest file is selected on start").
+    fn new(cfg: &PluginConfig) -> App {
+        let repo = std::env::current_dir().unwrap_or_default();
+        let theme = theme::resolve(Some(cfg.theme()));
+        let highlighter = Highlighter::new(theme.syntax);
+        let store = Store::open(&repo).ok();
+        let mut comments = CommentStore::new();
+        if let Some(store) = &store {
+            comments.replace(store.load());
+        }
+        let comments_signature = store.as_ref().map_or(0, Store::signature);
+        let files = file_list::markdown_files(&repo, cfg.show_ignored());
+        let mut app = App {
+            repo,
+            files,
+            file_cursor: 0,
+            file_scroll: 0,
+            docs: [DocPane::default(), DocPane::default()],
+            split: false,
+            focus: Focus::List,
+            store,
+            comments,
+            list_pct: DEFAULT_LIST_PCT,
+            wrap: true,
+            mode: Mode::default(),
+            input: String::new(),
+            caret: 0,
+            should_quit: false,
+            palette: theme.palette,
+            highlighter,
+            comments_signature,
+            show_ignored: cfg.show_ignored(),
+            resume_list: false,
+        };
+        if let Some(path) = app.files.first().map(|f| f.path.clone()) {
+            app.load_pane(0, &path);
+        }
+        app
+    }
+
+    // ---- focus & layout --------------------------------------------------------------
+
+    /// `Tab`: `List` → `DocA` → `DocB` (only while `split`) → `List`.
+    pub fn cycle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::List => Focus::DocA,
+            Focus::DocA if self.split => Focus::DocB,
+            Focus::DocA | Focus::DocB => Focus::List,
+        };
+    }
+
+    /// Flip split-doc mode. Leaving split while `DocB` is focused falls back to `DocA` —
+    /// `DocB` is never a valid focus target while its pane is hidden.
+    pub fn toggle_split(&mut self) {
+        self.split = !self.split;
+        if !self.split && self.focus == Focus::DocB {
+            self.focus = Focus::DocA;
+        }
+    }
+
+    pub fn toggle_wrap(&mut self) {
+        self.wrap = !self.wrap;
+    }
+
+    /// Resize the file-list pane by `delta` percentage points, clamped to
+    /// `MIN_LIST_PCT..=MAX_LIST_PCT`.
+    pub fn resize_list(&mut self, delta: i16) {
+        let next = (self.list_pct as i16 + delta).clamp(MIN_LIST_PCT as i16, MAX_LIST_PCT as i16);
+        self.list_pct = next as u16;
+    }
+
+    // ---- file list ---------------------------------------------------------------------
+
+    /// Move the file-list cursor by `delta`, load the file it lands on into the focused doc
+    /// pane, and scroll the list to keep it visible. A no-op with no files.
+    pub fn move_file_cursor(&mut self, delta: isize, area: Rect) {
+        if self.files.is_empty() {
+            return;
+        }
+        self.select_file(clamp_cursor(self.file_cursor, delta, self.files.len()), area);
+    }
+
+    /// Select file `idx`, load it into `focus_pane()` (`0` unless `focus` is exactly
+    /// `Focus::DocB`), and reveal the cursor in the file list.
+    fn select_file(&mut self, idx: usize, area: Rect) {
+        let Some(entry) = self.files.get(idx) else { return };
+        self.file_cursor = idx;
+        let path = entry.path.clone();
+        let pane = self.focus_pane();
+        self.load_pane(pane, &path);
+        self.reveal_file_cursor(area);
+    }
+
+    /// Read `path` (repo-relative) from disk, lossily as UTF-8 — empty when unreadable —
+    /// render it, and replace `docs[pane]` with the freshly loaded pane.
+    fn load_pane(&mut self, pane: usize, path: &str) {
+        let content = std::fs::read(self.repo.join(path))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        let doc = markdown::render_document(&content, &self.palette, &self.highlighter);
+        let line_starts = markdown::line_index(&content);
+        self.docs[pane] = DocPane {
+            path: Some(path.to_string()),
+            doc,
+            cursor_block: 0,
+            sel_anchor: None,
+            scroll: 0,
+            line_starts,
+        };
+    }
+
+    /// Scroll the file list so `file_cursor` is on screen — the minimal nudge.
+    fn reveal_file_cursor(&mut self, area: Rect) {
+        if self.files.is_empty() {
+            self.file_scroll = 0;
+            return;
+        }
+        let cursor = self.file_cursor.min(self.files.len() - 1);
+        let heights = vec![1usize; self.files.len()];
+        let viewport = ui::file_viewport_height(area, self.list_pct);
+        self.file_scroll = keep_in_view(cursor, self.file_scroll, &heights, viewport);
+    }
+
+    /// Scroll `pane`'s doc so `cursor_block`'s row is on screen. A no-op while composing on
+    /// this pane — `doc_row_heights` doesn't model the composer's spliced layout (`ui.rs`).
+    fn reveal_pane(&mut self, pane: usize, area: Rect) {
+        if matches!(self.mode, Mode::Composing { .. }) && self.focus_pane() == pane {
+            return;
+        }
+        if self.docs[pane].doc.blocks.is_empty() {
+            return;
+        }
+        let heights = ui::doc_row_heights(self, area, pane);
+        if heights.is_empty() {
+            return;
+        }
+        let width = ui::doc_inner_width(area, self.list_pct, self.split, pane);
+        let rows = markdown::layout_rows(&self.docs[pane].doc, width, self.wrap);
+        let cursor_block = self.docs[pane].cursor_block;
+        let row_ix = rows.iter().position(|r| r.block == cursor_block).unwrap_or(0);
+        let viewport = ui::doc_viewport_height(area, self.list_pct, self.split, pane);
+        self.docs[pane].scroll = keep_in_view(row_ix, self.docs[pane].scroll, &heights, viewport);
+    }
+
+    // ---- comment composer: caret editor -------------------------------------------------
+
+    pub fn composing(&self) -> bool {
+        matches!(self.mode, Mode::Composing { .. })
+    }
+
+    /// Open the composer for a brand-new comment anchored to the focused pane's current
+    /// selection (or lone cursor block). A no-op outside a doc pane, or on an empty doc.
+    fn start_comment(&mut self) {
+        if !matches!(self.focus, Focus::DocA | Focus::DocB) {
+            return;
+        }
+        let pane = self.focus_pane();
+        if self.docs[pane].doc.blocks.is_empty() {
+            return;
+        }
+        self.input.clear();
+        self.caret = 0;
+        self.resume_list = false;
+        self.mode = Mode::Composing { editing: None };
+    }
+
+    /// Open the composer over the targeted comment's existing text — the comment under the
+    /// doc cursor in a doc pane, or the highlighted row in the comments-list overlay. Submit
+    /// or cancel returns to the comments list when it was opened from there.
+    fn start_edit(&mut self) {
+        let Some(idx) = self.target_comment() else { return };
+        let Some(sc) = self.comments.get(idx) else { return };
+        self.resume_list = matches!(self.mode, Mode::CommentsList { .. });
+        self.input.clone_from(&sc.comment.text);
+        self.caret = self.input.chars().count();
+        self.mode = Mode::Composing { editing: Some(idx) };
+    }
+
+    /// Run a char-wise edit on `input`: collect it into a `Vec<char>` with the caret as an
+    /// in-range index, hand both to `f`, then reassemble and re-clamp the caret. A no-op
+    /// outside `Mode::Composing`.
+    fn edit_input(&mut self, f: impl FnOnce(&mut Vec<char>, &mut usize)) {
+        if !self.composing() {
+            return;
+        }
+        let mut v: Vec<char> = self.input.chars().collect();
+        let mut caret = self.caret.min(v.len());
+        f(&mut v, &mut caret);
+        self.caret = caret.min(v.len());
+        self.input = v.into_iter().collect();
+    }
+
+    /// Move the caret with a function of the current `Vec<char>` view. A no-op outside
+    /// `Mode::Composing`.
+    fn move_caret(&mut self, f: impl FnOnce(&[char], usize) -> usize) {
+        if self.composing() {
+            let v: Vec<char> = self.input.chars().collect();
+            self.caret = f(&v, self.caret.min(v.len()));
+        }
+    }
+
+    pub fn input_push(&mut self, ch: char) {
+        self.edit_input(|v, caret| {
+            v.insert(*caret, ch);
+            *caret += 1;
+        });
+    }
+
+    pub fn input_backspace(&mut self) {
+        self.edit_input(|v, caret| {
+            if *caret > 0 {
+                v.remove(*caret - 1);
+                *caret -= 1;
+            }
+        });
+    }
+
+    pub fn input_delete_forward(&mut self) {
+        self.edit_input(|v, caret| {
+            if *caret < v.len() {
+                v.remove(*caret);
+            }
+        });
+    }
+
+    /// Delete the word before the caret (`Ctrl+W`): trailing whitespace, then the
+    /// non-whitespace run before it.
+    pub fn input_delete_word(&mut self) {
+        self.edit_input(|v, caret| {
+            let start = word_start(v, *caret);
+            v.drain(start..*caret);
+            *caret = start;
+        });
+    }
+
+    /// Delete from the start of the logical line to the caret (`Ctrl+U`).
+    pub fn input_kill_to_start(&mut self) {
+        self.edit_input(|v, caret| {
+            let start = line_start(v, *caret);
+            v.drain(start..*caret);
+            *caret = start;
+        });
+    }
+
+    /// Delete from the caret to the end of the logical line (`Ctrl+K`).
+    pub fn input_kill_to_end(&mut self) {
+        self.edit_input(|v, caret| {
+            let end = line_end(v, *caret);
+            v.drain(*caret..end);
+        });
+    }
+
+    pub fn caret_left(&mut self) {
+        self.move_caret(|_, caret| caret.saturating_sub(1));
+    }
+
+    pub fn caret_right(&mut self) {
+        self.move_caret(|v, caret| (caret + 1).min(v.len()));
+    }
+
+    pub fn caret_home(&mut self) {
+        self.move_caret(line_start);
+    }
+
+    pub fn caret_end(&mut self) {
+        self.move_caret(line_end);
+    }
+
+    pub fn caret_word_left(&mut self) {
+        self.move_caret(word_start);
+    }
+
+    pub fn caret_word_right(&mut self) {
+        self.move_caret(word_end);
+    }
+
+    fn cancel_comment(&mut self) {
+        self.leave_compose();
+    }
+
+    /// Save the in-progress comment — editing the targeted one, or adding a new one anchored
+    /// to the focused pane's selection — then leave compose mode. Blank text cancels instead.
+    fn submit_comment(&mut self) {
+        let Mode::Composing { editing } = self.mode else { return };
+        let text = self.input.trim().to_string();
+        if text.is_empty() {
+            self.cancel_comment();
+            return;
+        }
+        if let Some(idx) = editing {
+            if self.comments.edit(idx, text) {
+                self.persist_comment(idx);
+            }
+        } else {
+            let pane = self.focus_pane();
+            self.add_comment(pane, text);
+        }
+        let pane = self.focus_pane();
+        self.docs[pane].sel_anchor = None;
+        self.leave_compose();
+    }
+
+    /// Leave compose mode: clear the input, and return to the comments-list overlay when
+    /// `start_edit` opened the composer from it (and any comments remain), else `Browse`.
+    fn leave_compose(&mut self) {
+        let editing = if let Mode::Composing { editing } = self.mode { editing } else { None };
+        self.input.clear();
+        self.caret = 0;
+        let resume = std::mem::take(&mut self.resume_list);
+        if resume && !self.comments.is_empty() {
+            let cursor = editing.unwrap_or(0).min(self.comments.len() - 1);
+            self.mode = Mode::CommentsList { cursor };
+        } else {
+            self.mode = Mode::Browse;
+        }
+    }
+
+    /// Persist the comment at `index` to `store`, when one is open; updates
+    /// `comments_signature` so the next poll tick doesn't see its own write as external.
+    fn persist_comment(&mut self, index: usize) {
+        let Some(store) = &self.store else { return };
+        let Some(sc) = self.comments.get(index) else { return };
+        match store.put(sc) {
+            Ok(()) => self.comments_signature = store.signature(),
+            Err(e) => logln!("app: failed to persist comment: {}", e.0),
+        }
+    }
+
+    // ---- comment actions: edit/delete/resolve/jump/list ---------------------------------
+
+    /// The comment index to act on: the comments-list overlay's highlighted row, or the
+    /// comment under the focused doc pane's cursor.
+    fn target_comment(&self) -> Option<usize> {
+        match self.mode {
+            Mode::CommentsList { cursor } => (cursor < self.comments.len()).then_some(cursor),
+            _ => self.comment_under_cursor(self.focus_pane()),
+        }
+    }
+
+    /// Delete the targeted comment (`d`) — from memory and, once persisted, from disk too.
+    pub fn delete_comment(&mut self) {
+        let Some(idx) = self.target_comment() else { return };
+        let Some(sc) = self.comments.get(idx) else { return };
+        let id = sc.id.clone();
+        self.comments.take(idx);
+        if let Some(store) = &self.store {
+            match store.remove(&id) {
+                Ok(_) => self.comments_signature = store.signature(),
+                Err(e) => logln!("app: failed to remove comment: {}", e.0),
+            }
+        }
+        if let Mode::CommentsList { cursor } = &mut self.mode {
+            *cursor = (*cursor).min(self.comments.len().saturating_sub(1));
+        }
+        // Don't strand the reviewer in an empty overlay.
+        if self.comments.is_empty() {
+            self.close_list();
+        }
+    }
+
+    /// Flip the targeted comment's open/resolved status (`x`), in memory and on disk.
+    pub fn resolve_selected_comment(&mut self) {
+        let Some(idx) = self.target_comment() else { return };
+        let Some(sc) = self.comments.get(idx) else { return };
+        let next = match sc.status {
+            Status::Open => Status::Resolved,
+            Status::Resolved => Status::Open,
+        };
+        let id = sc.id.clone();
+        self.comments.set_status(idx, next);
+        if let Some(store) = &self.store {
+            match store.set_status(&id, next) {
+                Ok(_) => self.comments_signature = store.signature(),
+                Err(e) => logln!("app: failed to persist resolve: {}", e.0),
+            }
+        }
+    }
+
+    /// Move the focused pane's cursor to the next (`dir >= 0`) or previous commented block
+    /// (`n`/`N`). A no-op outside a doc pane, or with nothing commented.
+    pub fn jump_comment(&mut self, dir: isize) {
+        if !matches!(self.focus, Focus::DocA | Focus::DocB) {
+            return;
+        }
+        let pane = self.focus_pane();
+        let mut commented: Vec<usize> = self
+            .comment_cards(pane)
+            .iter()
+            .enumerate()
+            .filter(|(_, cards)| !cards.is_empty())
+            .map(|(block, _)| block)
+            .collect();
+        if commented.is_empty() {
+            return;
+        }
+        commented.sort_unstable();
+        let cur = self.docs[pane].cursor_block;
+        let target = if dir >= 0 {
+            commented.iter().copied().find(|&b| b > cur).or_else(|| commented.first().copied())
+        } else {
+            commented.iter().rev().copied().find(|&b| b < cur).or_else(|| commented.last().copied())
+        };
+        if let Some(block) = target {
+            self.docs[pane].cursor_block = block;
+            self.docs[pane].sel_anchor = None;
+        }
+    }
+
+    /// Open the comments-list overlay (`l`). A no-op with no comments.
+    pub fn open_list(&mut self) {
+        if !self.comments.is_empty() {
+            self.mode = Mode::CommentsList { cursor: 0 };
+        }
+    }
+
+    pub fn close_list(&mut self) {
+        if matches!(self.mode, Mode::CommentsList { .. }) {
+            self.mode = Mode::Browse;
+        }
+    }
+
+    /// Move the comments-list overlay's cursor by `delta`. A no-op outside the overlay.
+    pub fn list_move(&mut self, delta: isize) {
+        if let Mode::CommentsList { cursor } = &mut self.mode
+            && !self.comments.is_empty()
+        {
+            *cursor = clamp_cursor(*cursor, delta, self.comments.len());
+        }
+    }
+
+    // ---- export --------------------------------------------------------------------------
+
+    /// Send (or copy) every open, user-authored comment: persist them all first (so a failed
+    /// export never loses one that only lived in memory), then hand `format_all`'s text to
+    /// `target`. Never consumes or resolves a comment (`G3`). A no-op with nothing to send.
+    pub fn export(&mut self, target: &dyn ExportTarget) {
+        self.persist_open_user_comments();
+        let refs: Vec<&Comment> =
+            self.comments.open_user_comments().into_iter().map(|sc| &sc.comment).collect();
+        if refs.is_empty() {
+            logln!("app: export skipped, no open user comments");
+            return;
+        }
+        let text = format_all(&refs);
+        let n = refs.len();
+        match target.export(&text) {
+            Ok(()) => logln!("app: exported {n} comment(s) to {}", target.label()),
+            Err(e) => logln!("app: export to {} failed: {e:#}", target.label()),
+        }
+    }
+
+    fn persist_open_user_comments(&mut self) {
+        let Some(store) = &self.store else { return };
+        for sc in self.comments.open_user_comments() {
+            if let Err(e) = store.put(sc) {
+                logln!("app: failed to persist comment {}: {}", sc.id, e.0);
+            }
+        }
+        self.comments_signature = store.signature();
+    }
+
+    // ---- poll-tick refresh -----------------------------------------------------------
+
+    /// Re-sync `comments` from `store` when its change signature has moved since the last
+    /// check — an agent's CLI write shows up on the next poll tick without the reviewer
+    /// doing anything. A no-op with no disk store.
+    fn check_comment_store(&mut self) {
+        let Some(store) = &self.store else { return };
+        let sig = store.signature();
+        if sig != self.comments_signature {
+            self.comments.replace(store.load());
+            self.comments_signature = sig;
+            if let Mode::CommentsList { cursor } = &mut self.mode {
+                *cursor = (*cursor).min(self.comments.len().saturating_sub(1));
+            }
+        }
+    }
+
+    /// Re-scan `repo` for markdown files, keeping the file cursor on the same path when it
+    /// still exists in the refreshed list.
+    fn refresh_files(&mut self) {
+        let current = self.files.get(self.file_cursor).map(|f| f.path.clone());
+        self.files = file_list::markdown_files(&self.repo, self.show_ignored);
+        self.file_cursor = current
+            .and_then(|p| self.files.iter().position(|f| f.path == p))
+            .unwrap_or(0)
+            .min(self.files.len().saturating_sub(1));
+    }
+
+    // ---- input dispatch --------------------------------------------------------------
+
+    /// Handle one key press. `area` is the terminal frame's rect — used only for
+    /// composer-width (`↑`/`↓` caret motion) and scroll-reveal geometry, never painted.
+    /// Terminal-free and synchronously testable: no `Frame`, no `crossterm::Event`.
+    pub fn on_key(&mut self, key: KeyEvent, area: Rect) {
+        use KeyCode::{Backspace, Char, Delete, Down, End, Enter, Esc, Home, Left, Right, Tab, Up};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        if self.composing() {
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            let alt_or_shift = key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
+            let word = alt || ctrl;
+            let pane = self.focus_pane();
+            let cw = ui::composer_content_width(ui::doc_inner_width(area, self.list_pct, self.split, pane));
+            match key.code {
+                Esc => self.cancel_comment(),
+                Enter if alt_or_shift => self.input_push('\n'),
+                Enter => self.submit_comment(),
+                Char('j') if ctrl => self.input_push('\n'),
+                Char('w') if ctrl => self.input_delete_word(),
+                Char('a') if ctrl => self.caret_home(),
+                Char('e') if ctrl => self.caret_end(),
+                Char('u') if ctrl => self.input_kill_to_start(),
+                Char('k') if ctrl => self.input_kill_to_end(),
+                Char('b') if alt => self.caret_word_left(),
+                Char('f') if alt => self.caret_word_right(),
+                Left if word => self.caret_word_left(),
+                Right if word => self.caret_word_right(),
+                Left => self.caret_left(),
+                Right => self.caret_right(),
+                Up => self.caret = ui::caret_vertical(&self.input, self.caret, cw, false),
+                Down => self.caret = ui::caret_vertical(&self.input, self.caret, cw, true),
+                Home => self.caret_home(),
+                End => self.caret_end(),
+                Delete => self.input_delete_forward(),
+                Backspace => self.input_backspace(),
+                Char(c) if !ctrl => self.input_push(c),
+                _ => {}
+            }
+            return;
+        }
+
+        if matches!(self.mode, Mode::CommentsList { .. }) {
+            match key.code {
+                Esc | Char('l' | 'q') => self.close_list(),
+                Char('j') | Down => self.list_move(1),
+                Char('k') | Up => self.list_move(-1),
+                Char('s') => self.export(&Agent),
+                Char('y') => self.export(&Clipboard),
+                Char('e') => self.start_edit(),
+                Char('d') => self.delete_comment(),
+                Char('x') => self.resolve_selected_comment(),
+                _ => {}
+            }
+            return;
+        }
+
+        // `Mode::Browse` from here: keys available regardless of which pane has focus.
+        match key.code {
+            Char('q') => {
+                self.should_quit = true;
+                return;
+            }
+            Tab => {
+                self.cycle_focus();
+                return;
+            }
+            Char('`') => {
+                self.toggle_split();
+                return;
+            }
+            Char('w') => {
+                self.toggle_wrap();
+                return;
+            }
+            Char(']') => {
+                self.resize_list(4);
+                return;
+            }
+            Char('[') => {
+                self.resize_list(-4);
+                return;
+            }
+            Char('l') => {
+                self.open_list();
+                return;
+            }
+            Char('s') => {
+                self.export(&Agent);
+                return;
+            }
+            Char('y') => {
+                self.export(&Clipboard);
+                return;
+            }
+            _ => {}
+        }
+
+        if self.focus == Focus::List {
+            match key.code {
+                Char('j') | Down => self.move_file_cursor(1, area),
+                Char('k') | Up => self.move_file_cursor(-1, area),
+                _ => {}
+            }
+            return;
+        }
+
+        // A doc pane has focus.
+        let pane = self.focus_pane();
+        match key.code {
+            Char('j') | Down => {
+                if self.docs[pane].sel_anchor.is_some() {
+                    self.extend_selection(pane, 1);
+                } else {
+                    self.move_cursor(pane, 1);
+                }
+                self.reveal_pane(pane, area);
+            }
+            Char('k') | Up => {
+                if self.docs[pane].sel_anchor.is_some() {
+                    self.extend_selection(pane, -1);
+                } else {
+                    self.move_cursor(pane, -1);
+                }
+                self.reveal_pane(pane, area);
+            }
+            Char('v') => self.start_selection(pane),
+            Esc => self.clear_selection(pane),
+            Char('c') => self.start_comment(),
+            Char('e') => self.start_edit(),
+            Char('d') => self.delete_comment(),
+            Char('n') => {
+                self.jump_comment(1);
+                self.reveal_pane(pane, area);
+            }
+            Char('N') => {
+                self.jump_comment(-1);
+                self.reveal_pane(pane, area);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// `cursor + delta`, clamped to `0..len` (or `0` for an empty document).
 fn clamp_cursor(cursor: usize, delta: isize, len: usize) -> usize {
     if len == 0 {
@@ -390,24 +1057,97 @@ fn comment_in_block(c: &Comment, block: &Block) -> bool {
     c.start <= block.source_end && block.source_start <= c.end
 }
 
-/// Entry point: set up the terminal, run the event loop, and restore it on exit (even
-/// on an error, so a panic-free failure never leaves the terminal in raw mode).
+/// Move `scroll` the minimal amount so the row at `cursor` fits within a `viewport`-tall
+/// window, given each row's display `heights`. Scrolls up when the cursor is above the top,
+/// advances the top until the cursor's row fits, then pulls back so the bottom isn't left
+/// blank — the shared "keep the cursor visible" rule for both the doc pane and the file list
+/// (which passes all-height-1 rows, where this degenerates to plain row arithmetic).
+fn keep_in_view(cursor: usize, scroll: usize, heights: &[usize], viewport: usize) -> usize {
+    if viewport == 0 || heights.is_empty() {
+        return 0;
+    }
+    let cursor = cursor.min(heights.len() - 1);
+    let mut top = scroll.min(cursor);
+    while top < cursor && heights[top..=cursor].iter().sum::<usize>() > viewport {
+        top += 1;
+    }
+    while top > 0 && heights[top - 1..].iter().sum::<usize>() <= viewport {
+        top -= 1;
+    }
+    top
+}
+
+/// The start of the logical line (after the previous `\n`, or 0) containing char `caret`.
+fn line_start(v: &[char], caret: usize) -> usize {
+    v[..caret].iter().rposition(|&c| c == '\n').map_or(0, |p| p + 1)
+}
+
+/// The end of the logical line (the next `\n`, or the end) containing char `caret`.
+fn line_end(v: &[char], caret: usize) -> usize {
+    v[caret..].iter().position(|&c| c == '\n').map_or(v.len(), |p| caret + p)
+}
+
+/// The start of the word before `caret`: skip trailing whitespace, then the word run.
+fn word_start(v: &[char], caret: usize) -> usize {
+    let mut i = caret;
+    while i > 0 && v[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !v[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+/// The end of the word after `caret`: skip leading whitespace, then the word run.
+fn word_end(v: &[char], caret: usize) -> usize {
+    let mut i = caret;
+    while i < v.len() && v[i].is_whitespace() {
+        i += 1;
+    }
+    while i < v.len() && !v[i].is_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// How often the poll tick re-checks the on-disk comment store and rescans the file list —
+/// picks up an agent's CLI writes and new files without the reviewer doing anything.
+const POLL: Duration = Duration::from_millis(1000);
+
+/// Entry point: resolve the plugin config, build the session, run the event loop, and
+/// restore the terminal on exit (even on an error, so a panic-free failure never leaves the
+/// terminal in raw mode).
 pub fn run_tui() -> Result<()> {
+    let cfg = config::plugin_config().unwrap_or_else(|e| {
+        logln!("run_tui: invalid plugin config, using defaults: {e}");
+        PluginConfig::default()
+    });
+    let mut app = App::new(&cfg);
     let mut terminal = ratatui::init();
-    let mut app = App::default();
     let result = event_loop(&mut terminal, &mut app);
     ratatui::restore();
     result
 }
 
-/// Draw-then-wait loop: paint the current state, then block for the next key press.
+/// Draw, then wait up to the poll deadline for a keypress; refresh on each tick.
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+    let mut last_poll = Instant::now();
     while !app.should_quit {
         terminal.draw(|frame| ui::render(frame, app))?;
-        if let Event::Key(key) = event::read()?
+        let size = terminal.size()?;
+        let area = Rect::new(0, 0, size.width, size.height);
+        let timeout = POLL.saturating_sub(last_poll.elapsed());
+        if event::poll(timeout)?
+            && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            app.on_key(key.code);
+            app.on_key(key, area);
+        }
+        if last_poll.elapsed() >= POLL {
+            app.check_comment_store();
+            app.refresh_files();
+            last_poll = Instant::now();
         }
     }
     Ok(())
@@ -439,7 +1179,29 @@ impl App {
             scroll: 0,
             line_starts,
         };
-        App { docs: [pane, DocPane::default()], store: None, palette, ..Default::default() }
+        App { docs: [pane, DocPane::default()], store: None, palette, highlighter, ..Default::default() }
+    }
+
+    /// Focus doc pane `pane` (`0` = `DocA`, `1` = `DocB`) directly, bypassing `cycle_focus` —
+    /// for `on_key` tests that need to start already inside a doc pane.
+    pub fn focus_doc_for_test(&mut self, pane: usize) {
+        self.focus = if pane == 0 { Focus::DocA } else { Focus::DocB };
+    }
+
+    /// Load `src` into `docs[pane]` directly, no disk I/O — for tests that need a second
+    /// pane populated (e.g. split-mode rendering).
+    pub fn load_into_test(&mut self, pane: usize, path: &str, src: &str) {
+        let highlighter = crate::highlight::Highlighter::new(theme::resolve(None).syntax);
+        let doc = crate::markdown::render_document(src, &self.palette, &highlighter);
+        let line_starts = crate::markdown::line_index(src);
+        self.docs[pane] = DocPane {
+            path: Some(path.to_string()),
+            doc,
+            cursor_block: 0,
+            sel_anchor: None,
+            scroll: 0,
+            line_starts,
+        };
     }
 }
 
