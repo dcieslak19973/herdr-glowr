@@ -1,4 +1,4 @@
-use herdr_glowr::markdown::{line_index, line_of, parse_blocks};
+use herdr_glowr::markdown::{line_index, line_of, parse_blocks, render_document};
 
 #[test]
 fn line_of_maps_bytes_to_1_based_lines() {
@@ -86,4 +86,47 @@ fn parse_blocks_indented_code_is_one_block_per_line() {
     let spans: Vec<(u32, u32)> = blocks.iter().map(|b| (b.source_start, b.source_end)).collect();
     // paragraph(1), then two indented code lines anchored to lines 3 and 4
     assert_eq!(spans, vec![(1, 1), (3, 3), (4, 4)]);
+}
+
+fn palette() -> herdr_glowr::theme::Palette {
+    herdr_glowr::theme::resolve(None).palette
+}
+
+fn highlighter() -> herdr_glowr::highlight::Highlighter {
+    herdr_glowr::highlight::Highlighter::new(herdr_glowr::theme::resolve(None).syntax)
+}
+
+fn plain(doc: &herdr_glowr::markdown::Document) -> Vec<String> {
+    doc.blocks.iter().flat_map(|b| b.rendered.iter().map(line_text)).collect()
+}
+
+fn line_text(l: &ratatui::text::Line) -> String {
+    l.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+#[test]
+fn heading_renders_with_hash_prefix_text() {
+    let doc = render_document("# Hello\n", &palette(), &highlighter());
+    assert!(plain(&doc).iter().any(|s| s.contains("Hello")));
+}
+
+#[test]
+fn bullet_item_renders_marker_and_text() {
+    let doc = render_document("- item one\n", &palette(), &highlighter());
+    let text: String = plain(&doc).join("\n");
+    assert!(text.contains("item one"));
+    assert!(text.contains('•') || text.contains('-'));
+}
+
+#[test]
+fn link_shows_label_and_url() {
+    let doc = render_document("[docs](http://x)\n", &palette(), &highlighter());
+    let text: String = plain(&doc).join("\n");
+    assert!(text.contains("docs") && text.contains("http://x"));
+}
+
+#[test]
+fn code_fence_line_is_rendered_verbatim() {
+    let doc = render_document("```rust\nlet x = 1;\n```\n", &palette(), &highlighter());
+    assert!(plain(&doc).iter().any(|s| s.contains("let x = 1;")));
 }

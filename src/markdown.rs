@@ -1,7 +1,11 @@
 //! Markdown parse + render + source mapping.
+use crate::highlight::Highlighter;
+use crate::theme::Palette;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use std::ops::Range;
+use unicode_width::UnicodeWidthStr;
 
 /// The smallest independently-commentable unit of a rendered document.
 #[derive(Clone, Debug)]
@@ -441,6 +445,232 @@ pub fn parse_blocks(source: &str) -> Vec<Block> {
     }
 
     blocks
+}
+
+/// A nominal column count used to size blocks that have no natural terminal-width input
+/// at this layer (tables, thematic rules); the row layer wraps/truncates to the real
+/// pane width later.
+const NOMINAL_WIDTH: usize = 80;
+
+/// The narrowest a table column is padded to, so a one-column table (or a very wide
+/// table) still reads as columns rather than collapsing to zero-width cells.
+const MIN_COL_WIDTH: usize = 4;
+
+/// Parse `source` and render every block's `kind`/`inlines` into styled, owned
+/// [`Line`]s against `palette`, highlighting fenced/indented code via `hl`.
+pub fn render_document(source: &str, palette: &Palette, hl: &Highlighter) -> Document {
+    let mut blocks = parse_blocks(source);
+    for block in &mut blocks {
+        block.rendered = render_block(&block.kind, &block.inlines, palette, hl);
+    }
+    Document { source: source.to_string(), blocks }
+}
+
+/// Render one block's `kind`/`inlines` to its terminal lines.
+fn render_block(
+    kind: &BlockKind,
+    inlines: &[Inline],
+    palette: &Palette,
+    hl: &Highlighter,
+) -> Vec<Line<'static>> {
+    match kind {
+        BlockKind::Heading(level) => vec![render_heading(*level, inlines, palette)],
+        BlockKind::Paragraph => render_inlines(inlines, Style::default().fg(palette.text), palette),
+        BlockKind::Item { ordered, marker, depth, task } => {
+            render_item(*ordered, marker, *depth, *task, inlines, palette)
+        }
+        BlockKind::Quote => render_quote(inlines, palette),
+        BlockKind::Code { lang, line } => vec![render_code_line(lang.as_deref(), line, palette, hl)],
+        BlockKind::TableRow { header, cells } => vec![render_table_row(*header, cells, palette)],
+        BlockKind::Rule => vec![render_rule(palette)],
+        BlockKind::Html(raw) => render_html(raw, palette),
+    }
+}
+
+/// A heading: bold, colored by level (h1 `mauve`, h2 `lavender` — this palette has no
+/// dedicated `blue`, so `lavender` stands in for the spec's "blue" — else `text`),
+/// prefixed with a dimmed `#`×level marker.
+fn render_heading(level: u8, inlines: &[Inline], palette: &Palette) -> Line<'static> {
+    let color = match level {
+        1 => palette.mauve,
+        2 => palette.lavender,
+        _ => palette.text,
+    };
+    let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::styled(
+        format!("{} ", "#".repeat(level as usize)),
+        Style::default().fg(palette.overlay0).add_modifier(Modifier::DIM),
+    )];
+    if let Some(first) = render_inlines(inlines, style, palette).into_iter().next() {
+        spans.extend(first.spans);
+    }
+    Line::from(spans)
+}
+
+/// A list item: `depth*2`-space indent, then a marker (`•` bullet / `N.` ordered /
+/// `[ ]`/`[x]` task), then the item's inline content. Continuation lines (from a
+/// `HardBreak`) align under the marker rather than repeating it.
+fn render_item(
+    ordered: bool,
+    marker: &str,
+    depth: u8,
+    task: Option<bool>,
+    inlines: &[Inline],
+    palette: &Palette,
+) -> Vec<Line<'static>> {
+    let indent = " ".repeat(depth as usize * 2);
+    let marker_text = match task {
+        Some(true) => "[x] ".to_string(),
+        Some(false) => "[ ] ".to_string(),
+        None if ordered => format!("{marker} "),
+        None => "• ".to_string(),
+    };
+    let cont_indent = " ".repeat(indent.width() + marker_text.width());
+    let marker_style = Style::default().fg(palette.text);
+    let body = render_inlines(inlines, Style::default().fg(palette.text), palette);
+    body.into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let mut spans = if i == 0 {
+                vec![Span::raw(indent.clone()), Span::styled(marker_text.clone(), marker_style)]
+            } else {
+                vec![Span::raw(cont_indent.clone())]
+            };
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// A blockquote: each body line prefixed with a `▍` bar in `overlay1`, body text in
+/// `subtext0` italic.
+fn render_quote(inlines: &[Inline], palette: &Palette) -> Vec<Line<'static>> {
+    let bar_style = Style::default().fg(palette.overlay1);
+    let body_style = Style::default().fg(palette.subtext0).add_modifier(Modifier::ITALIC);
+    render_inlines(inlines, body_style, palette)
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::styled("▍ ", bar_style)];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// One fenced/indented code line, highlighted for `lang` (falling back to plain
+/// `palette.text` when the highlighter has no match) on a subtle `surface0` code
+/// background.
+fn render_code_line(lang: Option<&str>, text: &str, palette: &Palette, hl: &Highlighter) -> Line<'static> {
+    let bg = palette.surface0;
+    let highlighted = hl.highlight(text, lang);
+    let spans: Vec<Span<'static>> = match highlighted.into_iter().next() {
+        Some(line_spans) if !line_spans.is_empty() => line_spans
+            .into_iter()
+            .map(|s| {
+                let (r, g, b) = s.color;
+                Span::styled(s.text, Style::default().fg(Color::Rgb(r, g, b)).bg(bg))
+            })
+            .collect(),
+        _ => vec![Span::styled(text.to_string(), Style::default().fg(palette.text).bg(bg))],
+    };
+    Line::from(spans)
+}
+
+/// One table row: `header` rows render bold; every cell is rendered (preserving its
+/// inline styling) then padded to an even share of [`NOMINAL_WIDTH`], separated by a
+/// dim `│`. Column alignment refinement is roadmap — v1 pads to even columns.
+fn render_table_row(header: bool, cells: &[Vec<Inline>], palette: &Palette) -> Line<'static> {
+    let base = Style::default().fg(palette.text);
+    let style = if header { base.add_modifier(Modifier::BOLD) } else { base };
+    let ncols = cells.len().max(1);
+    let col_width = (NOMINAL_WIDTH / ncols).max(MIN_COL_WIDTH);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, cell) in cells.iter().enumerate() {
+        let cell_line = render_inlines(cell, style, palette).into_iter().next().unwrap_or_default();
+        let content_width: usize = cell_line.spans.iter().map(|s| s.content.width()).sum();
+        spans.extend(cell_line.spans);
+        if content_width < col_width {
+            spans.push(Span::styled(" ".repeat(col_width - content_width), style));
+        }
+        if i + 1 < cells.len() {
+            spans.push(Span::styled(" │ ", Style::default().fg(palette.overlay0)));
+        }
+    }
+    Line::from(spans)
+}
+
+/// A full-width thematic break, in `overlay0`.
+fn render_rule(palette: &Palette) -> Line<'static> {
+    Line::from(Span::styled("─".repeat(NOMINAL_WIDTH), Style::default().fg(palette.overlay0)))
+}
+
+/// A raw HTML block, verbatim, dimmed `overlay0` — one `Line` per source line.
+fn render_html(raw: &str, palette: &Palette) -> Vec<Line<'static>> {
+    let style = Style::default().fg(palette.overlay0).add_modifier(Modifier::DIM);
+    let lines: Vec<Line<'static>> =
+        raw.lines().map(|l| Line::from(Span::styled(l.to_string(), style))).collect();
+    if lines.is_empty() { vec![Line::from(Span::styled(String::new(), style))] } else { lines }
+}
+
+/// Fold `inlines` into styled, owned [`Line`]s against `base`: `Text` keeps `base`;
+/// `Code` gets `green`-on-`surface0`; `Emph`/`Strong`/`Strike` layer modifiers over
+/// `base`; `Link` renders its label then ` (url)` in `lavender`/underline; `Image`
+/// renders a dim `image:` chip then its alt text; `SoftBreak` is a space; `HardBreak`
+/// starts a new `Line`.
+fn render_inlines(inlines: &[Inline], base: Style, palette: &Palette) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    render_inlines_into(inlines, base, palette, &mut lines, &mut current);
+    lines.push(Line::from(current));
+    lines
+}
+
+fn render_inlines_into(
+    inlines: &[Inline],
+    base: Style,
+    palette: &Palette,
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<Span<'static>>,
+) {
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) => current.push(Span::styled(text.clone(), base)),
+            Inline::Code(text) => current.push(Span::styled(
+                text.clone(),
+                Style::default().fg(palette.green).bg(palette.surface0),
+            )),
+            Inline::Emph(nodes) => {
+                render_inlines_into(nodes, base.add_modifier(Modifier::ITALIC), palette, lines, current);
+            }
+            Inline::Strong(nodes) => {
+                render_inlines_into(nodes, base.add_modifier(Modifier::BOLD), palette, lines, current);
+            }
+            Inline::Strike(nodes) => {
+                let style = base.add_modifier(Modifier::CROSSED_OUT).fg(palette.overlay1);
+                render_inlines_into(nodes, style, palette, lines, current);
+            }
+            Inline::Link { label, url } => {
+                render_inlines_into(label, base, palette, lines, current);
+                current.push(Span::raw(" ("));
+                current.push(Span::styled(
+                    url.clone(),
+                    Style::default().fg(palette.lavender).add_modifier(Modifier::UNDERLINED),
+                ));
+                current.push(Span::raw(")"));
+            }
+            Inline::Image { alt } => {
+                current.push(Span::styled(
+                    "image: ",
+                    Style::default().fg(palette.overlay0).add_modifier(Modifier::DIM),
+                ));
+                if !alt.is_empty() {
+                    current.push(Span::styled(alt.clone(), base));
+                }
+            }
+            Inline::SoftBreak => current.push(Span::raw(" ")),
+            Inline::HardBreak => lines.push(Line::from(std::mem::take(current))),
+        }
+    }
 }
 
 #[cfg(test)]
