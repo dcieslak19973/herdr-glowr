@@ -1,0 +1,144 @@
+id = "dcieslak19973.glowr"
+name = "glowr"
+version = "0.1.0"
+# 0.7.5 is the earliest herdr verified to honor item-level `platforms` filters (see
+# reviewr's docs/superpowers/specs/2026-07-30-windows-support-design.md); an older herdr
+# refuses here with a version message instead of half-installing a manifest it may misread
+# (e.g. running both [[build]] twins on unix).
+min_herdr_version = "0.7.5"
+platforms = ["macos", "linux", "windows"]
+description = "Native terminal markdown viewer and comment sidebar for herdr."
+
+# On `herdr plugin install`, download the prebuilt `herdr-glowr` binary for this platform
+# from the matching GitHub Release into $HERDR_PLUGIN_ROOT/bin (no Rust toolchain needed).
+# Skipped by `herdr plugin link` — for a local checkout, build it yourself with
+# `cargo install --path .`.
+#
+# Windows notes: commands are argv arrays herdr spawns directly — no shell — so each entry
+# has a unix item and a Windows twin gated by item-level `platforms`. herdr rejects
+# duplicate pane/action ids even across disjoint platforms, hence the `-windows` id
+# suffixes; on Windows, bind THOSE action ids. The PowerShell one-liners expand
+# $env:HERDR_PLUGIN_ROOT themselves and strip the `\\?\` verbatim prefix herdr reports on
+# Windows before invoking bin\herdr-glowr.exe by absolute path. Known limitation: the
+# `Substring(4)` strip assumes a `\\?\C:\...` local-drive prefix; a `\\?\UNC\server\share\...`
+# root (verbatim UNC) would be mangled the same way, but $HERDR_PLUGIN_ROOT hasn't been
+# observed to be a UNC path in practice.
+[[build]]
+platforms = ["macos", "linux"]
+command = ["bash", "herdr/install.sh"]
+
+[[build]]
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "herdr/install.ps1"]
+
+# The sidebar pane runs the downloaded binary by absolute path under the plugin root, since
+# the pane's cwd is the repo under review (not the plugin root) and the binary isn't on
+# PATH. Both platform twins share the `glowr` title, so the sidebar's label-based pane
+# discovery is platform-agnostic.
+[[panes]]
+id = "sidebar"
+platforms = ["macos", "linux"]
+title = "glowr"
+placement = "split"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-glowr\""]
+
+[[panes]]
+id = "sidebar-windows"
+platforms = ["windows"]
+title = "glowr"
+placement = "split"
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$r = $env:HERDR_PLUGIN_ROOT; if ($r -and $r.StartsWith('\\?\')) { $r = $r.Substring(4) }; $exe = Join-Path $r 'bin\herdr-glowr.exe'; & $exe''',
+]
+
+# Actions receive $HERDR_PLUGIN_ROOT, so they run the binary by absolute path and work
+# regardless of PATH. Sidebar orchestration lives in `herdr-glowr sidebar <mode>`.
+#
+# The unix commands below prepend a PATH before `exec`ing the binary: herdr runs plugin
+# commands with a minimal PATH, and `git` (spawned by the binary's `is_git_repo` check) can
+# otherwise go unfound for Homebrew-only-git macOS users. `skill-install` doesn't need git,
+# but the entries stay uniform.
+[[actions]]
+id = "skill-install"
+platforms = ["macos", "linux"]
+title = "glowr: install agent skill"
+contexts = ["pane", "workspace"]
+command = ["bash", "-c", 'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"; exec "$HERDR_PLUGIN_ROOT/bin/herdr-glowr" skill-install']
+
+[[actions]]
+id = "skill-install-windows"
+platforms = ["windows"]
+title = "glowr: install agent skill"
+contexts = ["pane", "workspace"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$r = $env:HERDR_PLUGIN_ROOT; if ($r -and $r.StartsWith('\\?\')) { $r = $r.Substring(4) }; $exe = Join-Path $r 'bin\herdr-glowr.exe'; & $exe skill-install''',
+]
+
+[[actions]]
+id = "toggle"
+platforms = ["macos", "linux"]
+title = "glowr: toggle sidebar"
+contexts = ["pane", "workspace"]
+command = ["bash", "-c", 'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"; exec "$HERDR_PLUGIN_ROOT/bin/herdr-glowr" sidebar toggle']
+
+[[actions]]
+id = "toggle-windows"
+platforms = ["windows"]
+title = "glowr: toggle sidebar"
+contexts = ["pane", "workspace"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$r = $env:HERDR_PLUGIN_ROOT; if ($r -and $r.StartsWith('\\?\')) { $r = $r.Substring(4) }; $exe = Join-Path $r 'bin\herdr-glowr.exe'; & $exe sidebar toggle''',
+]
+
+[[actions]]
+id = "open"
+platforms = ["macos", "linux"]
+title = "glowr: open sidebar"
+contexts = ["pane", "workspace"]
+command = ["bash", "-c", 'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"; exec "$HERDR_PLUGIN_ROOT/bin/herdr-glowr" sidebar open']
+
+[[actions]]
+id = "open-windows"
+platforms = ["windows"]
+title = "glowr: open sidebar"
+contexts = ["pane", "workspace"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$r = $env:HERDR_PLUGIN_ROOT; if ($r -and $r.StartsWith('\\?\')) { $r = $r.Substring(4) }; $exe = Join-Path $r 'bin\herdr-glowr.exe'; & $exe sidebar open''',
+]
+
+[[actions]]
+id = "close"
+platforms = ["macos", "linux"]
+title = "glowr: close sidebar"
+contexts = ["pane", "workspace"]
+command = ["bash", "-c", 'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"; exec "$HERDR_PLUGIN_ROOT/bin/herdr-glowr" sidebar close']
+
+[[actions]]
+id = "close-windows"
+platforms = ["windows"]
+title = "glowr: close sidebar"
+contexts = ["pane", "workspace"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$r = $env:HERDR_PLUGIN_ROOT; if ($r -and $r.StartsWith('\\?\')) { $r = $r.Substring(4) }; $exe = Join-Path $r 'bin\herdr-glowr.exe'; & $exe sidebar close''',
+]
+
+# Auto-open the sidebar for a freshly created worktree (gated by auto_open, default false;
+# see `herdr-glowr sidebar auto-open`). Events carry no ids, so the twins need no suffix. The
+# unix command prepends PATH for the same reason as the actions above.
+[[events]]
+on = "worktree.created"
+platforms = ["macos", "linux"]
+command = ["bash", "-c", 'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"; exec "$HERDR_PLUGIN_ROOT/bin/herdr-glowr" sidebar auto-open']
+
+[[events]]
+on = "worktree.created"
+platforms = ["windows"]
+command = [
+  "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+  '''$r = $env:HERDR_PLUGIN_ROOT; if ($r -and $r.StartsWith('\\?\')) { $r = $r.Substring(4) }; $exe = Join-Path $r 'bin\herdr-glowr.exe'; & $exe sidebar auto-open''',
+]
