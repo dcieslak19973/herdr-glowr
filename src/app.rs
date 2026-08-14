@@ -17,8 +17,9 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crate::comments::{Author, Store};
 use crate::file_list::FileEntry;
 use crate::logln;
-use crate::markdown::Document;
+use crate::markdown::{Block, Document};
 use crate::model::{Comment, CommentStore};
+use crate::theme::{self, Palette};
 use crate::ui;
 
 /// One open document: its rendered form, the reviewer's block cursor and selection
@@ -67,13 +68,55 @@ pub enum Mode {
     CommentsList { cursor: usize },
 }
 
+/// A footer action — what the bar offers for the current context. Semantic only:
+/// `ui::render_footer` maps each to its key glyph and label and styles it by [`Tier`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FooterAction {
+    Comment,
+    Select,
+    ClearSelection,
+    EditComment,
+    DeleteComment,
+    JumpComment,
+    /// Switch focus between the file list and the doc pane; the label names the destination.
+    CycleFocus,
+    Send,
+    List,
+    Copy,
+    /// Toggle the split-doc layout (Task 9).
+    Split,
+    Save,
+    Newline,
+    Cancel,
+    CloseList,
+    /// Flip the resolve/reopen status of the highlighted row (comments-list overlay only).
+    ResolveComment,
+    Quit,
+}
+
+/// A footer action's visual weight, and its survival priority when the line is too narrow:
+/// `Orientation` is dropped first, then trailing `Normal` actions; `Primary` is never dropped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    Primary,
+    Normal,
+    Orientation,
+}
+
+/// The file-list pane's default width, as a percentage of the terminal width.
+const DEFAULT_LIST_PCT: u16 = 32;
+
 /// The full state of a viewer session.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct App {
     /// The worktree root every relative path (files, comments) is resolved against.
     pub repo: PathBuf,
     /// The markdown files discovered in `repo`, newest-modified first.
     pub files: Vec<FileEntry>,
+    /// Index into `files` the file-list cursor rests on.
+    pub file_cursor: usize,
+    /// Scroll offset (rows) into `files`, kept in view by whatever moves `file_cursor`.
+    pub file_scroll: usize,
     /// The two document panes; only `docs[0]` is shown unless `split`.
     pub docs: [DocPane; 2],
     /// Whether both panes are visible side by side.
@@ -97,6 +140,35 @@ pub struct App {
     pub caret: usize,
     /// Set once the user has asked to quit.
     pub should_quit: bool,
+    /// The active palette every renderer paints from.
+    pub palette: Palette,
+}
+
+/// `App`'s defaults for a session that has not yet loaded a repo: an empty file list, a
+/// comfortable file-list width, wrap on (the common markdown-reading default), and the
+/// default theme's palette — everything a bare `run_tui` needs before Task 9's real
+/// initialization (repo scan, config, theme override) replaces it.
+impl Default for App {
+    fn default() -> Self {
+        App {
+            repo: PathBuf::new(),
+            files: Vec::new(),
+            file_cursor: 0,
+            file_scroll: 0,
+            docs: [DocPane::default(), DocPane::default()],
+            split: false,
+            focus: Focus::default(),
+            store: None,
+            comments: CommentStore::default(),
+            list_pct: DEFAULT_LIST_PCT,
+            wrap: true,
+            mode: Mode::default(),
+            input: String::new(),
+            caret: 0,
+            should_quit: false,
+            palette: theme::resolve(None).palette,
+        }
+    }
 }
 
 impl App {
@@ -186,6 +258,122 @@ impl App {
             self.should_quit = true;
         }
     }
+
+    /// The doc pane index `focus` currently points at: `Focus::DocB` (Task 9's split mode)
+    /// selects the second pane; the file list and `Focus::DocA` both fall back to the first.
+    pub fn focus_pane(&self) -> usize {
+        usize::from(self.focus == Focus::DocB)
+    }
+
+    /// For each block in `pane`'s document, the indices into `self.comments` whose card
+    /// renders after it — the last block a comment's line range overlaps, so a comment
+    /// spanning several blocks still shows exactly one card, anchored closest to its end.
+    pub fn comment_cards(&self, pane: usize) -> Vec<Vec<usize>> {
+        let doc_pane = &self.docs[pane];
+        let mut cards = vec![Vec::new(); doc_pane.doc.blocks.len()];
+        let Some(file) = doc_pane.path.as_deref() else { return cards };
+        for (ci, sc) in self.comments.iter().enumerate() {
+            if sc.comment.file != file {
+                continue;
+            }
+            if let Some(last) =
+                doc_pane.doc.blocks.iter().rposition(|b| comment_in_block(&sc.comment, b))
+            {
+                cards[last].push(ci);
+            }
+        }
+        cards
+    }
+
+    /// The store index of a comment anchored to `pane`'s current cursor block, if any —
+    /// names the edit/delete/jump actions in the footer.
+    pub fn comment_under_cursor(&self, pane: usize) -> Option<usize> {
+        let doc_pane = &self.docs[pane];
+        let file = doc_pane.path.as_deref()?;
+        let block = doc_pane.doc.blocks.get(doc_pane.cursor_block)?;
+        self.comments.iter().position(|sc| sc.comment.file == file && comment_in_block(&sc.comment, block))
+    }
+
+    /// The `path:start-end` the composer is anchored to — the pending selection for a new
+    /// comment, or the existing comment's location when editing. `None` outside
+    /// `Mode::Composing`.
+    pub fn pending_location(&self) -> Option<String> {
+        match &self.mode {
+            Mode::Composing { editing: Some(i) } => {
+                self.comments.get(*i).map(|sc| sc.comment.location())
+            }
+            Mode::Composing { editing: None } => {
+                let pane = self.focus_pane();
+                let (start, end, _) = self.anchor(pane)?;
+                let file = self.docs[pane].path.clone().unwrap_or_default();
+                Some(Comment { file, start, end, lines: String::new(), text: String::new() }.location())
+            }
+            Mode::Browse | Mode::CommentsList { .. } => None,
+        }
+    }
+
+    /// The actions the footer offers for the current context, most-relevant first, each
+    /// tagged with its visual tier. Pure — a context → action mapping, unit-tested without a
+    /// terminal. `ui::render_footer` maps each to a key+label, styles it by tier, and drops
+    /// the least relevant (orientation first) to fit one line.
+    pub fn footer_actions(&self) -> Vec<(FooterAction, Tier)> {
+        use FooterAction as A;
+        use Tier::{Normal, Orientation, Primary};
+
+        match &self.mode {
+            Mode::Composing { .. } => {
+                return vec![(A::Save, Primary), (A::Cancel, Normal), (A::Newline, Normal)];
+            }
+            Mode::CommentsList { .. } => {
+                return vec![
+                    (A::Send, Primary),
+                    (A::CloseList, Normal),
+                    (A::ResolveComment, Normal),
+                    (A::Copy, Normal),
+                    (A::EditComment, Normal),
+                    (A::DeleteComment, Normal),
+                ];
+            }
+            Mode::Browse => {}
+        }
+
+        let mut out: Vec<(FooterAction, Tier)> = Vec::new();
+        let mut cycle_is_primary = false;
+
+        if self.focus == Focus::List {
+            out.push((A::CycleFocus, Primary));
+            cycle_is_primary = true;
+        } else {
+            let pane = self.focus_pane();
+            let doc_pane = &self.docs[pane];
+            if doc_pane.doc.blocks.is_empty() {
+                out.push((A::CycleFocus, Primary));
+                cycle_is_primary = true;
+            } else if doc_pane.sel_anchor.is_some() {
+                out.push((A::Comment, Primary));
+                out.push((A::ClearSelection, Normal));
+            } else if self.comment_under_cursor(pane).is_some() {
+                out.push((A::EditComment, Primary));
+                out.push((A::DeleteComment, Normal));
+                out.push((A::JumpComment, Normal));
+            } else {
+                out.push((A::Comment, Primary));
+                out.push((A::Select, Normal));
+            }
+        }
+
+        if !self.comments.is_empty() {
+            out.insert(1, (A::Send, Normal));
+            out.push((A::List, Normal));
+        }
+
+        if !cycle_is_primary {
+            out.push((A::CycleFocus, Orientation));
+        }
+        out.push((A::Split, Orientation));
+        out.push((A::Quit, Orientation));
+        out
+    }
 }
 
 /// `cursor + delta`, clamped to `0..len` (or `0` for an empty document).
@@ -195,6 +383,11 @@ fn clamp_cursor(cursor: usize, delta: isize, len: usize) -> usize {
     }
     let next = cursor as isize + delta;
     next.clamp(0, len as isize - 1) as usize
+}
+
+/// Whether comment `c`'s line range overlaps `block`'s source line range.
+fn comment_in_block(c: &Comment, block: &Block) -> bool {
+    c.start <= block.source_end && block.source_start <= c.end
 }
 
 /// Entry point: set up the terminal, run the event loop, and restore it on exit (even
@@ -220,20 +413,22 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 impl App {
-    /// Build a single-pane `App` around `src`, rendered with the crate's default theme —
-    /// exactly what `ui`/event-loop tests need to drive `App` without a terminal or a
-    /// repo on disk. `store` is `None`; `add_comment` still updates `comments` in-memory.
-    pub(crate) fn for_test(src: &str) -> App {
+    /// Build a single-pane `App` around `src`, rendered with the crate's default theme — a
+    /// terminal-free `App` for `app`/`ui` tests, with no repo on disk. `store` is `None`;
+    /// `add_comment` still updates `comments` in-memory. Not `#[cfg(test)]`-gated: the
+    /// integration tests in `tests/` link this crate as a normal dependency (no `--cfg
+    /// test`), so a helper only they use must still be compiled unconditionally to be
+    /// reachable from there.
+    pub fn for_test(src: &str) -> App {
         Self::for_test_with_path(src, None)
     }
 
     /// As [`App::for_test`], but with `docs[0].path` set — for tests that exercise
-    /// `Comment::file`/`Comment::location`.
-    pub(crate) fn for_test_with_path(src: &str, path: Option<&str>) -> App {
-        let palette = crate::theme::resolve(None).palette;
-        let highlighter = crate::highlight::Highlighter::new(crate::theme::resolve(None).syntax);
+    /// `Comment::file`/`Comment::location` or the file-list pane.
+    pub fn for_test_with_path(src: &str, path: Option<&str>) -> App {
+        let palette = theme::resolve(None).palette;
+        let highlighter = crate::highlight::Highlighter::new(theme::resolve(None).syntax);
         let doc = crate::markdown::render_document(src, &palette, &highlighter);
         let line_starts = crate::markdown::line_index(src);
         let pane = DocPane {
@@ -244,7 +439,7 @@ impl App {
             scroll: 0,
             line_starts,
         };
-        App { docs: [pane, DocPane::default()], store: None, ..Default::default() }
+        App { docs: [pane, DocPane::default()], store: None, palette, ..Default::default() }
     }
 }
 

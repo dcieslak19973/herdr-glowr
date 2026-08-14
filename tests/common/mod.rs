@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use ratatui::buffer::Buffer;
 use tempfile::TempDir;
 
 pub struct TempRepo {
@@ -56,4 +57,20 @@ impl TempRepo {
         self.git(&["add", "-A"]);
         self.git(&["commit", "-q", "-m", message]);
     }
+}
+
+/// Concatenate every cell's symbol, row by row, into one string (rows separated by `\n`) —
+/// a plain-text view of a rendered `Buffer` for substring assertions in render tests.
+pub fn buffer_to_string(buffer: &Buffer) -> String {
+    let area = buffer.area;
+    let mut out = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            if let Some(cell) = buffer.cell((x, y)) {
+                out.push_str(cell.symbol());
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
