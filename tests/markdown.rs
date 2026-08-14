@@ -1,4 +1,4 @@
-use herdr_glowr::markdown::{line_index, line_of, parse_blocks, render_document};
+use herdr_glowr::markdown::{layout_rows, line_index, line_of, parse_blocks, render_document};
 
 #[test]
 fn line_of_maps_bytes_to_1_based_lines() {
@@ -129,4 +129,22 @@ fn link_shows_label_and_url() {
 fn code_fence_line_is_rendered_verbatim() {
     let doc = render_document("```rust\nlet x = 1;\n```\n", &palette(), &highlighter());
     assert!(plain(&doc).iter().any(|s| s.contains("let x = 1;")));
+}
+
+#[test]
+fn layout_wraps_long_paragraph_into_multiple_rows() {
+    let long = "word ".repeat(40);
+    let doc = render_document(&format!("{long}\n"), &palette(), &highlighter());
+    let rows = layout_rows(&doc, 20, true);
+    assert!(rows.len() > 1);
+    assert!(rows[0].first_of_block);
+    assert!(!rows[1].first_of_block);
+    assert!(rows.iter().all(|r| r.block == 0));
+}
+
+#[test]
+fn layout_no_wrap_is_one_row_per_line() {
+    let doc = render_document("# H\n\npara\n", &palette(), &highlighter());
+    let rows = layout_rows(&doc, 80, false);
+    assert_eq!(rows.iter().filter(|r| r.first_of_block).count(), 2); // heading + paragraph
 }

@@ -5,7 +5,7 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::ops::Range;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// The smallest independently-commentable unit of a rendered document.
 #[derive(Clone, Debug)]
@@ -671,6 +671,148 @@ fn render_inlines_into(
             Inline::HardBreak => lines.push(Line::from(std::mem::take(current))),
         }
     }
+}
+
+/// Flatten `doc`'s rendered blocks into paint-ready rows at `width` columns: this is the
+/// single source of row geometry (invariant G5), so what this function measures is what the
+/// pane later paints. When `wrap`, each block's rendered `Line` expands to its greedy-wrapped
+/// rows via [`wrap_line`] (continuations carry `first_of_block: false`); when `!wrap`, each
+/// `Line` becomes exactly one row. `first_of_block` is set only for a block's very first row.
+pub fn layout_rows(doc: &Document, width: usize, wrap: bool) -> Vec<RenderRow> {
+    let mut rows = Vec::new();
+    for (block_ix, block) in doc.blocks.iter().enumerate() {
+        for (line_ix, line) in block.rendered.iter().enumerate() {
+            if wrap {
+                for (seg_ix, wrapped) in wrap_line(line, width).into_iter().enumerate() {
+                    rows.push(RenderRow {
+                        line: wrapped,
+                        block: block_ix,
+                        first_of_block: line_ix == 0 && seg_ix == 0,
+                    });
+                }
+            } else {
+                rows.push(RenderRow { line: line.clone(), block: block_ix, first_of_block: line_ix == 0 });
+            }
+        }
+    }
+    rows
+}
+
+/// The source line a row belongs to: its block's `source_start`.
+pub fn row_source_line(doc: &Document, rows: &[RenderRow], row_ix: usize) -> u32 {
+    doc.blocks[rows[row_ix].block].source_start
+}
+
+/// Greedy word-wrap of a styled `line` into `width` columns, breaking at the last space that
+/// fits (hard-breaking a single word wider than the column); leading spaces on a continuation
+/// row are dropped. An empty line still yields one (empty) row so it occupies a row. Ported
+/// from herdr-reviewr's diff-pane `wrap_segments`/`Cell`, generalized from per-glyph diff
+/// cells (fg color + emphasis flag) to arbitrary ratatui [`Span`]s (full [`Style`]), with the
+/// diff change-bar/gutter/line-number concerns dropped.
+pub fn wrap_line(line: &Line, width: usize) -> Vec<Line<'static>> {
+    let cells = line_cells(line);
+    let width = width.max(1);
+    wrap_segments(&cells, width)
+        .into_iter()
+        .map(|(start, end)| Line::from(cells_to_spans(&cells[start..end])))
+        .collect()
+}
+
+/// Tabs expand to this many columns.
+const TAB: usize = 4;
+
+/// One display cell of a styled line: a glyph, its terminal column width (via
+/// `unicode-width`, so wide CJK/emoji glyphs measure as the two columns they paint), and the
+/// style of the span it came from.
+struct Cell {
+    ch: char,
+    w: usize,
+    style: Style,
+}
+
+/// Expand a line's spans into display cells: tabs become spaces to the next tab stop, and
+/// each char carries its column width and its span's style.
+fn line_cells(line: &Line) -> Vec<Cell> {
+    let mut cells = Vec::new();
+    let mut col = 0usize; // display column, so tab stops land right after wide glyphs too
+    for span in &line.spans {
+        let style = span.style;
+        for ch in span.content.chars() {
+            if ch == '\t' {
+                for _ in 0..(TAB - col % TAB) {
+                    cells.push(Cell { ch: ' ', w: 1, style });
+                    col += 1;
+                }
+            } else {
+                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                cells.push(Cell { ch, w, style });
+                col += w;
+            }
+        }
+    }
+    cells
+}
+
+/// Greedy word wrap over display cells into half-open ranges, one per display row.
+///
+/// Breaks at the last space that fits within `width`, falling back to a hard break when a
+/// single glyph run is wider than the column. Leading spaces on a continuation are dropped so
+/// a break landing just before a space doesn't leave an almost-empty row. An empty line still
+/// yields one (empty) range so it occupies a row. [`wrap_line`] and [`layout_rows`] share this
+/// so what's measured matches what's painted.
+fn wrap_segments(cells: &[Cell], width: usize) -> Vec<(usize, usize)> {
+    if cells.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut segs = Vec::new();
+    let mut start = 0;
+    while start < cells.len() {
+        // Take as many cells as fit within `width` columns, always at least one (so a glyph
+        // wider than the column still gets its own row rather than stalling).
+        let mut col = 0;
+        let mut limit = start;
+        while limit < cells.len() {
+            let cw = cells[limit].w;
+            if col + cw > width && limit > start {
+                break;
+            }
+            col += cw;
+            limit += 1;
+        }
+        if limit == cells.len() {
+            segs.push((start, cells.len()));
+            break;
+        }
+        // More cells follow; prefer breaking just after the last space that fits.
+        let brk = (start..limit).rev().find(|&i| cells[i].ch == ' ').map(|i| i + 1);
+        let end = brk.filter(|&e| e > start).unwrap_or(limit);
+        segs.push((start, end));
+        start = end;
+        while start < cells.len() && cells[start].ch == ' ' {
+            start += 1;
+        }
+    }
+    segs
+}
+
+/// Build spans from display cells, merging runs of equal style.
+fn cells_to_spans(cells: &[Cell]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    for cell in cells {
+        if cur != Some(cell.style) {
+            if let Some(style) = cur {
+                spans.push(Span::styled(std::mem::take(&mut buf), style));
+            }
+            cur = Some(cell.style);
+        }
+        buf.push(cell.ch);
+    }
+    if let Some(style) = cur {
+        spans.push(Span::styled(buf, style));
+    }
+    spans
 }
 
 #[cfg(test)]
