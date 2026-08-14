@@ -123,6 +123,11 @@ pub fn in_files_pane(area: Rect, list_pct: u16, col: u16, row: u16) -> bool {
     contains(panes(area, list_pct).files, col, row)
 }
 
+/// Whether `(col, row)` falls in `pane`'s doc rect, so the wheel scrolls the pane it is over.
+pub fn in_doc_pane(area: Rect, list_pct: u16, split: bool, pane: usize, col: u16, row: u16) -> bool {
+    contains(doc_rect(area, list_pct, split, pane), col, row)
+}
+
 /// The render-row index (into `markdown::layout_rows(&app.docs[0].doc, ..)`) a click at
 /// `(col, row)` lands on, or `None` if outside the doc pane. `heights` (display rows per
 /// render row, including any spliced comment cards — see [`doc_row_heights`]) and
@@ -214,14 +219,36 @@ pub fn doc_inner_width(area: Rect, list_pct: u16, split: bool, pane: usize) -> u
     inner_rect(doc_rect(area, list_pct, split, pane)).width as usize
 }
 
+/// The header's `[ Send (N) ]` button's column span (half-open) within `header`. Shared by
+/// [`render_header`] (paint) and [`hit_send_button`] (click) so they can't desync (`G5`).
+fn send_button_span(header: Rect, app: &App) -> (u16, u16) {
+    let width = header.width as usize;
+    let title = " glowr";
+    let button = format!("[ Send ({}) ]", app.comments.sendable());
+    let pad = width.saturating_sub(title.width() + button.width() + 1);
+    let start = header.x + (title.width() + pad) as u16;
+    (start, start + button.width() as u16)
+}
+
+/// Whether `(col, row)` lands on the header's `[ Send (N) ]` button — a click sends, same as
+/// the `s` key.
+pub fn hit_send_button(area: Rect, list_pct: u16, app: &App, col: u16, row: u16) -> bool {
+    let header = panes(area, list_pct).header;
+    if row != header.y {
+        return false;
+    }
+    let (start, end) = send_button_span(header, app);
+    col >= start && col < end
+}
+
 /// The header band: `glowr`, then a right-aligned `[ Send (N) ]` button naming exactly the
 /// open, user-authored comment count a send would deliver (`CommentStore::sendable`).
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let p = &app.palette;
-    let width = area.width as usize;
     let title = " glowr";
     let button = format!("[ Send ({}) ]", app.comments.sendable());
-    let pad = width.saturating_sub(title.width() + button.width() + 1);
+    let (start, _end) = send_button_span(area, app);
+    let pad = (start - area.x) as usize - title.width();
     let spans = vec![
         Span::styled(title, Style::default().fg(p.text).add_modifier(Modifier::BOLD)),
         Span::raw(" ".repeat(pad)),

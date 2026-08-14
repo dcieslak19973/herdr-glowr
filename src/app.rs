@@ -13,11 +13,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
 
 use crate::comments::{Author, Status, Store};
-use crate::config::{self, PluginConfig};
+use crate::config::{self, CommentSync, PluginConfig};
 use crate::export::{Agent, Clipboard, ExportTarget, format_all};
 use crate::file_list::{self, FileEntry};
 use crate::highlight::Highlighter;
@@ -172,6 +176,15 @@ pub struct App {
     /// split mode is left, so a list selection never silently lands in a hidden pane.
     /// Defaults to `0` so single-pane browsing is unaffected.
     list_target_pane: usize,
+    /// When a fresh comment persists to `store`: immediately (default), or held in memory
+    /// until `App::export` flushes it (`config::CommentSync::OnSend`). From the plugin
+    /// config's `comment_sync` key; agent-authored comments (CLI-written) are unaffected —
+    /// this only gates the TUI's own `add_comment`.
+    comment_sync: CommentSync,
+    /// Whether a mouse drag is currently moving the pane divider — `on_mouse` sets this on a
+    /// divider grab and clears it on button-up; `on_key` also clears it, so a keypress mid-drag
+    /// (opening a modal) can't strand it `true`.
+    resizing: bool,
 }
 
 /// `App`'s defaults for a session that has not yet loaded a repo: an empty file list, a
@@ -203,6 +216,8 @@ impl Default for App {
             show_ignored: false,
             resume_list: false,
             list_target_pane: 0,
+            comment_sync: CommentSync::Immediate,
+            resizing: false,
         }
     }
 }
@@ -273,14 +288,17 @@ impl App {
     }
 
     /// Anchor `pane`'s current selection and record it as a new comment: persisted to
-    /// `store` (as `Author::User`) when one is open — a persistence failure is logged and
-    /// otherwise ignored, never lost from the in-memory view — and always appended to
-    /// `comments`. A no-op when the pane has no blocks to anchor to.
+    /// `store` (as `Author::User`) immediately when `comment_sync` is `Immediate` (the
+    /// default) and one is open — a persistence failure is logged and otherwise ignored,
+    /// never lost from the in-memory view. Under `comment_sync: on-send` it stays
+    /// memory-only until `App::export` flushes it (`persist_open_user_comments`). Always
+    /// appended to `comments`. A no-op when the pane has no blocks to anchor to.
     pub fn add_comment(&mut self, pane: usize, text: String) {
         let Some((start, end, lines)) = self.anchor(pane) else { return };
         let file = self.docs[pane].path.clone().unwrap_or_default();
         let comment = Comment { file, start, end, lines, text };
-        if let Some(store) = &self.store
+        if self.comment_sync == CommentSync::Immediate
+            && let Some(store) = &self.store
             && let Err(e) = store.add(&comment, Author::User)
         {
             logln!("app: failed to persist comment: {}", e.0);
@@ -449,6 +467,8 @@ impl App {
             show_ignored: cfg.show_ignored(),
             resume_list: false,
             list_target_pane: 0,
+            comment_sync: cfg.comment_sync(),
+            resizing: false,
         };
         if let Some(path) = app.files.first().map(|f| f.path.clone()) {
             app.load_pane(0, &path);
@@ -570,6 +590,180 @@ impl App {
         let row_ix = rows.iter().position(|r| r.block == cursor_block).unwrap_or(0);
         let viewport = ui::doc_viewport_height(area, self.list_pct, self.split, pane);
         self.docs[pane].scroll = keep_in_view(row_ix, self.docs[pane].scroll, &heights, viewport);
+    }
+
+    // ---- mouse ---------------------------------------------------------------------------
+
+    /// Handle one mouse event. `area` is the terminal frame's rect, exactly as `on_key` uses
+    /// it for geometry. Terminal-free and synchronously testable, mirroring `on_key`. The
+    /// composer and the comments-list overlay capture the screen and are keyboard-driven, so
+    /// the mouse is inert under them — a click can't drive the panes painted underneath
+    /// (mirrors reviewr).
+    pub fn on_mouse(&mut self, m: MouseEvent, area: Rect) {
+        if self.composing() || matches!(self.mode, Mode::CommentsList { .. }) {
+            return;
+        }
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.mouse_down(m.column, m.row, area),
+            MouseEventKind::Drag(MouseButton::Left) => self.mouse_drag(m.column, m.row, area),
+            MouseEventKind::Up(MouseButton::Left) => self.resizing = false,
+            MouseEventKind::ScrollDown => self.wheel(m.column, m.row, area, 3),
+            MouseEventKind::ScrollUp => self.wheel(m.column, m.row, area, -3),
+            _ => {}
+        }
+    }
+
+    /// A left click: the divider (start a resize drag), the `[ Send (N) ]` button, a file
+    /// row, or a doc pane's block — checked in that order (the divider's grab zone can
+    /// straddle the doc/file border; the header row never overlaps the body, so order
+    /// between it and the rest doesn't matter).
+    fn mouse_down(&mut self, col: u16, row: u16, area: Rect) {
+        if ui::hit_divider(area, self.list_pct, col, row) {
+            self.resizing = true;
+            return;
+        }
+        if ui::hit_send_button(area, self.list_pct, self, col, row) {
+            self.export(&Agent);
+            return;
+        }
+        if let Some(idx) =
+            ui::hit_file(area, self.list_pct, col, row, self.files.len(), self.file_scroll)
+        {
+            self.focus = Focus::List;
+            self.select_file(idx, area);
+            return;
+        }
+        for &pane in self.visible_panes() {
+            let heights = ui::doc_row_heights(self, area, pane);
+            let Some(row_ix) = ui::hit_doc(
+                area,
+                self.list_pct,
+                self.split,
+                pane,
+                col,
+                row,
+                &heights,
+                self.docs[pane].scroll,
+            ) else {
+                continue;
+            };
+            let width = ui::doc_inner_width(area, self.list_pct, self.split, pane);
+            let rows = markdown::layout_rows(&self.docs[pane].doc, width, self.wrap);
+            if let Some(r) = rows.get(row_ix) {
+                self.docs[pane].cursor_block = r.block;
+            }
+            self.docs[pane].sel_anchor = None;
+            self.focus = if pane == 0 { Focus::DocA } else { Focus::DocB };
+            self.list_target_pane = pane;
+            return;
+        }
+    }
+
+    /// A left-button drag: resize the divider while `resizing`, else extend the block
+    /// selection under the pointer in whichever doc pane it is over (anchoring the selection
+    /// on the first drag tick, like `v` does).
+    fn mouse_drag(&mut self, col: u16, row: u16, area: Rect) {
+        if self.resizing {
+            let body = ui::body_rect(area);
+            self.drag_divider(body.width, col.saturating_sub(body.x));
+            return;
+        }
+        for &pane in self.visible_panes() {
+            let heights = ui::doc_row_heights(self, area, pane);
+            let Some(row_ix) = ui::hit_doc(
+                area,
+                self.list_pct,
+                self.split,
+                pane,
+                col,
+                row,
+                &heights,
+                self.docs[pane].scroll,
+            ) else {
+                continue;
+            };
+            let width = ui::doc_inner_width(area, self.list_pct, self.split, pane);
+            let rows = markdown::layout_rows(&self.docs[pane].doc, width, self.wrap);
+            if let Some(r) = rows.get(row_ix) {
+                self.drag_select_to(pane, r.block);
+            }
+            return;
+        }
+    }
+
+    /// Extend `pane`'s selection to `block`, anchoring at the current cursor on the first
+    /// drag tick — the mouse equivalent of `v` then `j`/`k`.
+    fn drag_select_to(&mut self, pane: usize, block: usize) {
+        if block >= self.docs[pane].doc.blocks.len() {
+            return;
+        }
+        if self.docs[pane].sel_anchor.is_none() {
+            self.docs[pane].sel_anchor = Some(self.docs[pane].cursor_block);
+        }
+        self.docs[pane].cursor_block = block;
+        self.focus = if pane == 0 { Focus::DocA } else { Focus::DocB };
+        self.list_target_pane = pane;
+    }
+
+    /// Set `list_pct` so the divider sits at body column `x` (a mouse drag). `x` is measured
+    /// from the body's left edge; the file list spans from there to the right edge.
+    fn drag_divider(&mut self, body_width: u16, x: u16) {
+        if body_width == 0 {
+            return;
+        }
+        let list_cols = body_width.saturating_sub(x.min(body_width));
+        let pct = (u32::from(list_cols) * 100 / u32::from(body_width)) as u16;
+        self.list_pct = pct.clamp(MIN_LIST_PCT, MAX_LIST_PCT);
+    }
+
+    /// Route a wheel tick to whichever pane the pointer is over: the file list, or a doc
+    /// pane.
+    fn wheel(&mut self, col: u16, row: u16, area: Rect, delta: isize) {
+        if ui::in_files_pane(area, self.list_pct, col, row) {
+            self.wheel_files(delta, area);
+            return;
+        }
+        for &pane in self.visible_panes() {
+            if ui::in_doc_pane(area, self.list_pct, self.split, pane, col, row) {
+                self.wheel_doc(pane, delta, area);
+                return;
+            }
+        }
+    }
+
+    /// Wheel-scroll the file list's viewport, leaving the selection untouched. Bounded so it
+    /// never shows a blank tail.
+    fn wheel_files(&mut self, delta: isize, area: Rect) {
+        if self.files.is_empty() {
+            return;
+        }
+        let viewport = ui::file_viewport_height(area, self.list_pct);
+        let next = offset_by(self.file_scroll, delta);
+        self.file_scroll = next.min(self.files.len().saturating_sub(viewport));
+    }
+
+    /// Wheel-scroll `pane`'s doc viewport, leaving `cursor_block` put — so wheeling to read
+    /// context never moves what a comment would anchor to. Bounded by the summed row heights
+    /// so it never shows a blank tail.
+    fn wheel_doc(&mut self, pane: usize, delta: isize, area: Rect) {
+        if self.docs[pane].doc.blocks.is_empty() {
+            return;
+        }
+        let heights = ui::doc_row_heights(self, area, pane);
+        if heights.is_empty() {
+            return;
+        }
+        let viewport = ui::doc_viewport_height(area, self.list_pct, self.split, pane);
+        let total: usize = heights.iter().sum();
+        let next = offset_by(self.docs[pane].scroll, delta);
+        self.docs[pane].scroll = next.min(total.saturating_sub(viewport));
+    }
+
+    /// The doc pane indices a click/drag/wheel should consider — both when split, else only
+    /// the sole visible pane.
+    fn visible_panes(&self) -> &'static [usize] {
+        const BOTH: [usize; 2] = [0, 1];
+        if self.split { &BOTH } else { &BOTH[..1] }
     }
 
     // ---- comment composer: caret editor -------------------------------------------------
@@ -925,6 +1119,9 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent, area: Rect) {
         use KeyCode::{Backspace, Char, Delete, Down, End, Enter, Esc, Home, Left, Right, Tab, Up};
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // A keypress ends any in-progress divider drag, so opening a modal mid-drag (which
+        // makes the mouse handler ignore the releasing `Up`) can't strand `resizing` true.
+        self.resizing = false;
 
         if self.composing() {
             let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -1096,6 +1293,16 @@ fn keep_in_view(cursor: usize, scroll: usize, heights: &[usize], viewport: usize
     top
 }
 
+/// Move a scroll offset by `delta` rows, saturating at 0 — the wheel's raw motion, before the
+/// caller clamps the upper bound once the viewport is known (`wheel_files`/`wheel_doc`).
+fn offset_by(scroll: usize, delta: isize) -> usize {
+    if delta >= 0 {
+        scroll.saturating_add(delta.unsigned_abs())
+    } else {
+        scroll.saturating_sub(delta.unsigned_abs())
+    }
+}
+
 /// The start of the logical line (after the previous `\n`, or 0) containing char `caret`.
 fn line_start(v: &[char], caret: usize) -> usize {
     v[..caret].iter().rposition(|&c| c == '\n').map_or(0, |p| p + 1)
@@ -1144,12 +1351,15 @@ pub fn run_tui() -> Result<()> {
     });
     let mut app = App::new(&cfg);
     let mut terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let result = event_loop(&mut terminal, &mut app);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
 
-/// Draw, then wait up to the poll deadline for a keypress; refresh on each tick.
+/// Draw, then wait up to the poll deadline for a keypress or mouse event; refresh on each
+/// tick.
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut last_poll = Instant::now();
     while !app.should_quit {
@@ -1157,11 +1367,12 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
         let timeout = POLL.saturating_sub(last_poll.elapsed());
-        if event::poll(timeout)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.on_key(key, area);
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key, area),
+                Event::Mouse(m) => app.on_mouse(m, area),
+                _ => {}
+            }
         }
         if last_poll.elapsed() >= POLL {
             app.check_comment_store();
@@ -1221,6 +1432,12 @@ impl App {
             scroll: 0,
             line_starts,
         };
+    }
+
+    /// Set `comment_sync` directly — for tests exercising `add_comment`'s on-send gating
+    /// without going through `App::new`/the plugin config.
+    pub fn set_comment_sync_for_test(&mut self, sync: CommentSync) {
+        self.comment_sync = sync;
     }
 }
 
