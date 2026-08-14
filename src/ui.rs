@@ -28,9 +28,21 @@ pub fn render(frame: &mut Frame, app: &App) {
     let p = panes(area, app.list_pct);
 
     render_header(frame, app, p.header);
-    render_doc_view(frame, app, 0, app.focus == Focus::DocA, doc_rect(area, app.list_pct, app.split, 0));
+    render_doc_view(
+        frame,
+        app,
+        0,
+        app.focus == Focus::DocA,
+        doc_rect(area, app.list_pct, app.split, 0),
+    );
     if app.split {
-        render_doc_view(frame, app, 1, app.focus == Focus::DocB, doc_rect(area, app.list_pct, app.split, 1));
+        render_doc_view(
+            frame,
+            app,
+            1,
+            app.focus == Focus::DocB,
+            doc_rect(area, app.list_pct, app.split, 1),
+        );
     }
     render_file_list(frame, app, p.files);
     render_footer(frame, app, p.footer);
@@ -77,8 +89,8 @@ fn doc_rect(area: Rect, list_pct: u16, split: bool, pane: usize) -> Rect {
     if !split {
         return doc_area;
     }
-    let halves =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(doc_area);
+    let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(doc_area);
     halves[pane.min(1)]
 }
 
@@ -124,7 +136,14 @@ pub fn in_files_pane(area: Rect, list_pct: u16, col: u16, row: u16) -> bool {
 }
 
 /// Whether `(col, row)` falls in `pane`'s doc rect, so the wheel scrolls the pane it is over.
-pub fn in_doc_pane(area: Rect, list_pct: u16, split: bool, pane: usize, col: u16, row: u16) -> bool {
+pub fn in_doc_pane(
+    area: Rect,
+    list_pct: u16,
+    split: bool,
+    pane: usize,
+    col: u16,
+    row: u16,
+) -> bool {
     contains(doc_rect(area, list_pct, split, pane), col, row)
 }
 
@@ -312,8 +331,9 @@ fn render_doc_view(frame: &mut Frame, app: &App, pane: usize, focused: bool, are
         }
         out
     };
-    let display =
-        |range: std::ops::Range<usize>| -> Vec<Line<'static>> { range.flat_map(&row_lines).collect() };
+    let display = |range: std::ops::Range<usize>| -> Vec<Line<'static>> {
+        range.flat_map(&row_lines).collect()
+    };
 
     let total = rows.len();
     let composing_here = matches!(app.mode, Mode::Composing { .. }) && app.focus_pane() == pane;
@@ -329,7 +349,8 @@ fn render_doc_view(frame: &mut Frame, app: &App, pane: usize, focused: bool, are
     let box_h = composer_height(app, width).min(height.saturating_sub(1)).max(1);
     let doc_budget = height - box_h;
     let hi_block = hi.min(doc_pane.doc.blocks.len().saturating_sub(1));
-    let anchor_row = rows.iter().rposition(|r| r.block == hi_block).unwrap_or(total.saturating_sub(1));
+    let anchor_row =
+        rows.iter().rposition(|r| r.block == hi_block).unwrap_or(total.saturating_sub(1));
     let above_all = display(doc_pane.scroll..anchor_row + 1);
     let above: Vec<Line> = if above_all.len() > doc_budget {
         above_all[above_all.len() - doc_budget..].to_vec()
@@ -386,7 +407,13 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
 
 /// A file row: the basename bright, its parent directories dimmed. A path too wide for the
 /// row keeps its tail behind a leading `…/`.
-fn file_row_item(path: &str, width: usize, fill: Option<Color>, ignored: bool, p: &Palette) -> ListItem<'static> {
+fn file_row_item(
+    path: &str,
+    width: usize,
+    fill: Option<Color>,
+    ignored: bool,
+    p: &Palette,
+) -> ListItem<'static> {
     let shown = elide_head(path, width.max(1));
     let (dim, base) = match shown.rfind('/') {
         Some(s) => (&shown[..=s], &shown[s + 1..]),
@@ -515,8 +542,10 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     let loc = app.pending_location().unwrap_or_else(|| "comment".to_string());
     let editing = matches!(app.mode, Mode::Composing { editing: Some(_) });
     let title = if editing { format!("edit · {loc}") } else { format!("comment · {loc}") };
-    let block =
-        Block::default().borders(Borders::ALL).border_style(Style::default().fg(p.peach)).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.peach))
+        .title(title);
     let content_w = composer_content_width(area.width as usize);
     let body = Paragraph::new(composer_lines(app, content_w)).block(block);
     frame.render_widget(body, area);
@@ -537,7 +566,11 @@ fn composer_lines(app: &App, content_w: usize) -> Vec<Line<'static>> {
     rows.iter()
         .enumerate()
         .map(|(i, (_, text))| {
-            if i == caret_row { row_with_caret(text, caret_col, p) } else { Line::from(text.clone()) }
+            if i == caret_row {
+                row_with_caret(text, caret_col, p)
+            } else {
+                Line::from(text.clone())
+            }
         })
         .collect()
 }
@@ -810,7 +843,11 @@ fn text_style(p: &Palette) -> Style {
 /// the same treatment the doc cursor uses, so every cursor in the UI reads the same. The
 /// fill is applied per span (with a trailing pad) so it spans the full width under the
 /// `List` widget, matching the doc pane's `Paragraph` rows.
-fn selectable_row(mut spans: Vec<Span<'static>>, width: usize, fill: Option<Color>) -> ListItem<'static> {
+fn selectable_row(
+    mut spans: Vec<Span<'static>>,
+    width: usize,
+    fill: Option<Color>,
+) -> ListItem<'static> {
     if let Some(bg) = fill {
         let used: usize = spans.iter().map(Span::width).sum();
         if width > used {
@@ -827,7 +864,10 @@ fn selectable_row(mut spans: Vec<Span<'static>>, width: usize, fill: Option<Colo
 /// to a surface tone.
 fn bordered(title: &str, focused: bool, p: &Palette) -> Block<'static> {
     let color = if focused { p.lavender } else { p.surface2 };
-    Block::default().borders(Borders::ALL).border_style(Style::default().fg(color)).title(title.to_string())
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(title.to_string())
 }
 
 fn dim_paragraph<'a>(text: &'a str, p: &Palette) -> Paragraph<'a> {

@@ -9,7 +9,9 @@ use herdr_glowr::comments::Store;
 use herdr_glowr::config::CommentSync;
 use herdr_glowr::file_list::FileEntry;
 use herdr_glowr::{markdown, ui};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 
 fn key(c: char) -> KeyEvent {
@@ -21,7 +23,12 @@ fn tab() -> KeyEvent {
 }
 
 fn left_click(col: u16, row: u16) -> MouseEvent {
-    MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: col, row, modifiers: KeyModifiers::empty() }
+    MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: col,
+        row,
+        modifiers: KeyModifiers::empty(),
+    }
 }
 
 /// Scan `area` for a `(col, row)` where `ui::hit_file` lands on file index `idx` — robust to
@@ -49,9 +56,16 @@ fn find_doc_click(app: &App, area: Rect, pane: usize, target_block: usize) -> (u
     let rows = markdown::layout_rows(&app.docs[pane].doc, width, app.wrap);
     for row in 0..area.height {
         for col in 0..area.width {
-            if let Some(row_ix) =
-                ui::hit_doc(area, app.list_pct, app.split, pane, col, row, &heights, app.docs[pane].scroll)
-                && rows.get(row_ix).is_some_and(|r| r.block == target_block)
+            if let Some(row_ix) = ui::hit_doc(
+                area,
+                app.list_pct,
+                app.split,
+                pane,
+                col,
+                row,
+                &heights,
+                app.docs[pane].scroll,
+            ) && rows.get(row_ix).is_some_and(|r| r.block == target_block)
             {
                 return (col, row);
             }
@@ -124,7 +138,8 @@ fn mouse_click_in_doc_pane_moves_block_cursor() {
 #[test]
 fn mouse_click_on_file_row_loads_it() {
     let mut app = App::for_test_with_path("# H\n", Some("p.md"));
-    app.files = vec![FileEntry { path: "other.md".into(), mtime: SystemTime::now(), ignored: false }];
+    app.files =
+        vec![FileEntry { path: "other.md".into(), mtime: SystemTime::now(), ignored: false }];
     let (col, row) = find_file_click(AREA, app.list_pct, app.files.len(), 0);
     app.on_mouse(left_click(col, row), AREA);
     assert_eq!(app.focus, Focus::List);
@@ -141,10 +156,7 @@ fn comment_sync_on_send_keeps_new_comments_memory_only() {
     app.docs[0].cursor_block = 1;
     app.add_comment(0, "note".into());
     assert_eq!(app.comments.open_user_comments().len(), 1, "the comment is still in memory");
-    assert!(
-        !dir.path().join("comments").exists(),
-        "on-send must not touch the store until export"
-    );
+    assert!(!dir.path().join("comments").exists(), "on-send must not touch the store until export");
 }
 
 #[test]

@@ -57,21 +57,10 @@ pub enum Inline {
 pub(crate) enum BlockKind {
     Heading(u8),
     Paragraph,
-    Item {
-        ordered: bool,
-        marker: String,
-        depth: u8,
-        task: Option<bool>,
-    },
+    Item { ordered: bool, marker: String, depth: u8, task: Option<bool> },
     Quote,
-    Code {
-        lang: Option<String>,
-        line: String,
-    },
-    TableRow {
-        header: bool,
-        cells: Vec<Vec<Inline>>,
-    },
+    Code { lang: Option<String>, line: String },
+    TableRow { header: bool, cells: Vec<Vec<Inline>> },
     Rule,
     Html(String),
 }
@@ -157,10 +146,7 @@ fn heading_level_u8(level: HeadingLevel) -> u8 {
 /// source so numbering/bullet style always matches what the author wrote.
 fn item_marker(source: &str, range: &Range<usize>) -> String {
     let text = &source[range.start..range.end.min(source.len())];
-    text.trim_start()
-        .chars()
-        .take_while(|c| !c.is_whitespace())
-        .collect()
+    text.trim_start().chars().take_while(|c| !c.is_whitespace()).collect()
 }
 
 /// Per-item state tracked between `Start(Item)` and `End(Item)`, supporting nested lists.
@@ -199,10 +185,7 @@ pub fn parse_blocks(source: &str) -> Vec<Block> {
     let mut current_row_cells: Vec<Vec<Inline>> = Vec::new();
 
     let span = |range: &Range<usize>| -> (u32, u32) {
-        (
-            line_of(&idx, range.start),
-            line_of(&idx, range.end.saturating_sub(1)),
-        )
+        (line_of(&idx, range.start), line_of(&idx, range.end.saturating_sub(1)))
     };
 
     for (event, range) in Parser::new_ext(source, opts).into_offset_iter() {
@@ -272,11 +255,8 @@ pub fn parse_blocks(source: &str) -> Vec<Block> {
                 TagEnd::Paragraph => {
                     if item_depth == 0 {
                         let inlines = pop_nodes(&mut inline_stack);
-                        let kind = if quote_depth > 0 {
-                            BlockKind::Quote
-                        } else {
-                            BlockKind::Paragraph
-                        };
+                        let kind =
+                            if quote_depth > 0 { BlockKind::Quote } else { BlockKind::Paragraph };
                         let (source_start, source_end) = span(&range);
                         blocks.push(Block {
                             source_start,
@@ -329,9 +309,7 @@ pub fn parse_blocks(source: &str) -> Vec<Block> {
                 TagEnd::Item => {
                     item_depth -= 1;
                     let inlines = pop_nodes(&mut inline_stack);
-                    let ctx = item_ctx_stack
-                        .pop()
-                        .expect("End(Item) without matching Start(Item)");
+                    let ctx = item_ctx_stack.pop().expect("End(Item) without matching Start(Item)");
                     let (source_start, source_end) = span(&range);
                     blocks.push(Block {
                         source_start,
@@ -480,7 +458,9 @@ fn render_block(
             render_item(*ordered, marker, *depth, *task, inlines, palette)
         }
         BlockKind::Quote => render_quote(inlines, palette),
-        BlockKind::Code { lang, line } => vec![render_code_line(lang.as_deref(), line, palette, hl)],
+        BlockKind::Code { lang, line } => {
+            vec![render_code_line(lang.as_deref(), line, palette, hl)]
+        }
         BlockKind::TableRow { header, cells } => vec![render_table_row(*header, cells, palette)],
         BlockKind::Rule => vec![render_rule(palette)],
         BlockKind::Html(raw) => render_html(raw, palette),
@@ -560,7 +540,12 @@ fn render_quote(inlines: &[Inline], palette: &Palette) -> Vec<Line<'static>> {
 /// One fenced/indented code line, highlighted for `lang` (falling back to plain
 /// `palette.text` when the highlighter has no match) on a subtle `surface0` code
 /// background.
-fn render_code_line(lang: Option<&str>, text: &str, palette: &Palette, hl: &Highlighter) -> Line<'static> {
+fn render_code_line(
+    lang: Option<&str>,
+    text: &str,
+    palette: &Palette,
+    hl: &Highlighter,
+) -> Line<'static> {
     let bg = palette.surface0;
     let highlighted = hl.highlight(text, lang);
     let spans: Vec<Span<'static>> = match highlighted.into_iter().next() {
@@ -640,10 +625,22 @@ fn render_inlines_into(
                 Style::default().fg(palette.green).bg(palette.surface0),
             )),
             Inline::Emph(nodes) => {
-                render_inlines_into(nodes, base.add_modifier(Modifier::ITALIC), palette, lines, current);
+                render_inlines_into(
+                    nodes,
+                    base.add_modifier(Modifier::ITALIC),
+                    palette,
+                    lines,
+                    current,
+                );
             }
             Inline::Strong(nodes) => {
-                render_inlines_into(nodes, base.add_modifier(Modifier::BOLD), palette, lines, current);
+                render_inlines_into(
+                    nodes,
+                    base.add_modifier(Modifier::BOLD),
+                    palette,
+                    lines,
+                    current,
+                );
             }
             Inline::Strike(nodes) => {
                 let style = base.add_modifier(Modifier::CROSSED_OUT).fg(palette.overlay1);
@@ -691,7 +688,11 @@ pub fn layout_rows(doc: &Document, width: usize, wrap: bool) -> Vec<RenderRow> {
                     });
                 }
             } else {
-                rows.push(RenderRow { line: line.clone(), block: block_ix, first_of_block: line_ix == 0 });
+                rows.push(RenderRow {
+                    line: line.clone(),
+                    block: block_ix,
+                    first_of_block: line_ix == 0,
+                });
             }
         }
     }
@@ -817,7 +818,7 @@ fn cells_to_spans(cells: &[Cell]) -> Vec<Span<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{line_index, parse_blocks, BlockKind, Inline};
+    use super::{BlockKind, Inline, line_index, parse_blocks};
 
     #[test]
     fn line_index_returns_byte_offset_of_each_line_start() {
@@ -830,10 +831,7 @@ mod tests {
         let blocks = parse_blocks("*em*\n");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].kind, BlockKind::Paragraph);
-        assert_eq!(
-            blocks[0].inlines,
-            vec![Inline::Emph(vec![Inline::Text("em".to_string())])]
-        );
+        assert_eq!(blocks[0].inlines, vec![Inline::Emph(vec![Inline::Text("em".to_string())])]);
     }
 
     #[test]
@@ -877,12 +875,7 @@ mod tests {
         // Regression: alt text used to drop everything but bare Text/Code nodes, so
         // "**bold**" inside an image's alt disappeared entirely.
         let blocks = parse_blocks("![a **bold** b](img.png)\n");
-        assert_eq!(
-            blocks[0].inlines,
-            vec![Inline::Image {
-                alt: "a bold b".to_string()
-            }]
-        );
+        assert_eq!(blocks[0].inlines, vec![Inline::Image { alt: "a bold b".to_string() }]);
     }
 
     #[test]
@@ -916,21 +909,11 @@ mod tests {
         let blocks = parse_blocks("1. one\n2. two\n");
         assert_eq!(
             blocks[0].kind,
-            BlockKind::Item {
-                ordered: true,
-                marker: "1.".to_string(),
-                depth: 1,
-                task: None,
-            }
+            BlockKind::Item { ordered: true, marker: "1.".to_string(), depth: 1, task: None }
         );
         assert_eq!(
             blocks[1].kind,
-            BlockKind::Item {
-                ordered: true,
-                marker: "2.".to_string(),
-                depth: 1,
-                task: None,
-            }
+            BlockKind::Item { ordered: true, marker: "2.".to_string(), depth: 1, task: None }
         );
     }
 
@@ -948,12 +931,7 @@ mod tests {
         );
         assert_eq!(
             blocks[1].kind,
-            BlockKind::Item {
-                ordered: false,
-                marker: "-".to_string(),
-                depth: 1,
-                task: Some(true),
-            }
+            BlockKind::Item { ordered: false, marker: "-".to_string(), depth: 1, task: Some(true) }
         );
     }
 

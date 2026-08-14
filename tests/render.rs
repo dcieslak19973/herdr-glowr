@@ -56,8 +56,9 @@ fn split_renders_two_docs() {
 fn cell_fg_at(buf: &Buffer, needle: &str) -> Option<Color> {
     let area = buf.area;
     for y in 0..area.height {
-        let row: String =
-            (0..area.width).map(|x| buf.cell((x, y)).map_or(" ", |c| c.symbol()).to_string()).collect();
+        let row: String = (0..area.width)
+            .map(|x| buf.cell((x, y)).map_or(" ", |c| c.symbol()).to_string())
+            .collect();
         if let Some(byte_off) = row.find(needle) {
             let col = row[..byte_off].chars().count() as u16;
             return buf.cell((area.x + col, area.y + y)).map(|c| c.fg);

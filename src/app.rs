@@ -249,11 +249,8 @@ impl App {
         let end = selected.iter().map(|b| b.source_end).max().unwrap_or(start);
 
         let start_byte = doc_pane.line_starts.get((start - 1) as usize).copied().unwrap_or(0);
-        let end_byte = doc_pane
-            .line_starts
-            .get(end as usize)
-            .copied()
-            .unwrap_or(doc_pane.doc.source.len());
+        let end_byte =
+            doc_pane.line_starts.get(end as usize).copied().unwrap_or(doc_pane.doc.source.len());
         let lines = doc_pane.doc.source[start_byte..end_byte].trim_end_matches('\n').to_string();
         Some((start, end, lines))
     }
@@ -262,7 +259,8 @@ impl App {
     /// block range, and drop any active selection — plain navigation, not extension.
     pub fn move_cursor(&mut self, pane: usize, delta: isize) {
         let doc_pane = &mut self.docs[pane];
-        doc_pane.cursor_block = clamp_cursor(doc_pane.cursor_block, delta, doc_pane.doc.blocks.len());
+        doc_pane.cursor_block =
+            clamp_cursor(doc_pane.cursor_block, delta, doc_pane.doc.blocks.len());
         doc_pane.sel_anchor = None;
     }
 
@@ -279,7 +277,8 @@ impl App {
         if doc_pane.sel_anchor.is_none() {
             doc_pane.sel_anchor = Some(doc_pane.cursor_block);
         }
-        doc_pane.cursor_block = clamp_cursor(doc_pane.cursor_block, delta, doc_pane.doc.blocks.len());
+        doc_pane.cursor_block =
+            clamp_cursor(doc_pane.cursor_block, delta, doc_pane.doc.blocks.len());
     }
 
     /// Drop `pane`'s active selection, if any, leaving the cursor where it is.
@@ -338,7 +337,9 @@ impl App {
         let doc_pane = &self.docs[pane];
         let file = doc_pane.path.as_deref()?;
         let block = doc_pane.doc.blocks.get(doc_pane.cursor_block)?;
-        self.comments.iter().position(|sc| sc.comment.file == file && comment_in_block(&sc.comment, block))
+        self.comments
+            .iter()
+            .position(|sc| sc.comment.file == file && comment_in_block(&sc.comment, block))
     }
 
     /// The `path:start-end` the composer is anchored to — the pending selection for a new
@@ -353,7 +354,10 @@ impl App {
                 let pane = self.focus_pane();
                 let (start, end, _) = self.anchor(pane)?;
                 let file = self.docs[pane].path.clone().unwrap_or_default();
-                Some(Comment { file, start, end, lines: String::new(), text: String::new() }.location())
+                Some(
+                    Comment { file, start, end, lines: String::new(), text: String::new() }
+                        .location(),
+                )
             }
             Mode::Browse | Mode::CommentsList { .. } => None,
         }
@@ -1128,7 +1132,12 @@ impl App {
             let alt_or_shift = key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
             let word = alt || ctrl;
             let pane = self.focus_pane();
-            let cw = ui::composer_content_width(ui::doc_inner_width(area, self.list_pct, self.split, pane));
+            let cw = ui::composer_content_width(ui::doc_inner_width(
+                area,
+                self.list_pct,
+                self.split,
+                pane,
+            ));
             match key.code {
                 Esc => self.cancel_comment(),
                 Enter if alt_or_shift => self.input_push('\n'),
@@ -1409,7 +1418,13 @@ impl App {
             scroll: 0,
             line_starts,
         };
-        App { docs: [pane, DocPane::default()], store: None, palette, highlighter, ..Default::default() }
+        App {
+            docs: [pane, DocPane::default()],
+            store: None,
+            palette,
+            highlighter,
+            ..Default::default()
+        }
     }
 
     /// Focus doc pane `pane` (`0` = `DocA`, `1` = `DocB`) directly, bypassing `cycle_focus` —

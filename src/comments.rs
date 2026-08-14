@@ -337,7 +337,13 @@ fn from_value(v: &Value) -> Option<StoredComment> {
     let end = u32::try_from(v.get("end")?.as_u64()?).ok()?;
     let lines = v.get("lines")?.as_str()?.to_string();
     let text = v.get("text")?.as_str()?.to_string();
-    Some(StoredComment { id, author, status, created_at, comment: Comment { file, start, end, lines, text } })
+    Some(StoredComment {
+        id,
+        author,
+        status,
+        created_at,
+        comment: Comment { file, start, end, lines, text },
+    })
 }
 
 #[cfg(test)]

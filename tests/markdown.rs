@@ -23,10 +23,7 @@ fn parse_blocks_code_fence_is_one_block_per_line() {
     let src = "```\nlet x = 1;\nlet y = 2;\n```\n";
     let blocks = parse_blocks(src);
     // two code lines → two blocks anchored to lines 2 and 3
-    assert_eq!(
-        blocks.iter().map(|b| b.source_start).collect::<Vec<_>>(),
-        vec![2, 3]
-    );
+    assert_eq!(blocks.iter().map(|b| b.source_start).collect::<Vec<_>>(), vec![2, 3]);
 }
 
 #[test]

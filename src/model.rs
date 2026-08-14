@@ -114,12 +114,18 @@ impl CommentStore {
     /// Open, user-authored comments — exactly what a send/export sends and a Send button
     /// counts. An agent's own comments and already-resolved ones are never part of the payload.
     pub fn open_user_comments(&self) -> Vec<&StoredComment> {
-        self.items.iter().filter(|sc| sc.status == Status::Open && sc.author == Author::User).collect()
+        self.items
+            .iter()
+            .filter(|sc| sc.status == Status::Open && sc.author == Author::User)
+            .collect()
     }
 
     /// The count `open_user_comments` would return, without allocating the `Vec`.
     pub fn sendable(&self) -> usize {
-        self.items.iter().filter(|sc| sc.status == Status::Open && sc.author == Author::User).count()
+        self.items
+            .iter()
+            .filter(|sc| sc.status == Status::Open && sc.author == Author::User)
+            .count()
     }
 }
 
