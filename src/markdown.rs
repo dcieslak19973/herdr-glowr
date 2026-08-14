@@ -35,7 +35,7 @@ pub struct Document {
 }
 
 /// A flattened inline-formatting node, built from pulldown-cmark's inline event stream.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Inline {
     Text(String),
     Code(String),
@@ -49,7 +49,7 @@ pub enum Inline {
 }
 
 /// The structural kind of a [`Block`], as distinguished by the parser.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BlockKind {
     Heading(u8),
     Paragraph,
@@ -102,14 +102,30 @@ enum InlineFrame {
     Alt(String),
 }
 
+/// Flattens an [`Inline`] node to its visible plain text (recursing through formatting
+/// wrappers), for building an image's flat `alt` string from arbitrarily nested markup.
+fn flatten_text(inline: &Inline, out: &mut String) {
+    match inline {
+        Inline::Text(t) | Inline::Code(t) => out.push_str(t),
+        Inline::Emph(v) | Inline::Strong(v) | Inline::Strike(v) => {
+            for n in v {
+                flatten_text(n, out);
+            }
+        }
+        Inline::Link { label, .. } => {
+            for n in label {
+                flatten_text(n, out);
+            }
+        }
+        Inline::Image { alt } => out.push_str(alt),
+        Inline::SoftBreak | Inline::HardBreak => out.push(' '),
+    }
+}
+
 fn push_inline(stack: &mut [InlineFrame], inline: Inline) {
     match stack.last_mut() {
         Some(InlineFrame::Nodes(v)) => v.push(inline),
-        Some(InlineFrame::Alt(s)) => {
-            if let Inline::Text(t) | Inline::Code(t) = &inline {
-                s.push_str(t);
-            }
-        }
+        Some(InlineFrame::Alt(s)) => flatten_text(&inline, s),
         None => {}
     }
 }
@@ -375,13 +391,10 @@ pub fn parse_blocks(source: &str) -> Vec<Block> {
                     push_inline(&mut inline_stack, Inline::Link { label, url });
                 }
                 TagEnd::Image => {
+                    // Tag::Image always pushes an `Alt` frame; nothing else can be on top.
                     let alt = match inline_stack.pop() {
                         Some(InlineFrame::Alt(s)) => s,
-                        Some(InlineFrame::Nodes(v)) => v
-                            .into_iter()
-                            .map(|n| if let Inline::Text(t) = n { t } else { String::new() })
-                            .collect(),
-                        None => String::new(),
+                        _ => String::new(),
                     };
                     push_inline(&mut inline_stack, Inline::Image { alt });
                 }
@@ -428,4 +441,172 @@ pub fn parse_blocks(source: &str) -> Vec<Block> {
     }
 
     blocks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{line_index, parse_blocks, BlockKind, Inline};
+
+    #[test]
+    fn line_index_returns_byte_offset_of_each_line_start() {
+        assert_eq!(line_index("a\nbb\n"), vec![0, 2, 5]);
+        assert_eq!(line_index("no newline"), vec![0]);
+    }
+
+    #[test]
+    fn emphasis_builds_a_nested_inline_node() {
+        let blocks = parse_blocks("*em*\n");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(
+            blocks[0].inlines,
+            vec![Inline::Emph(vec![Inline::Text("em".to_string())])]
+        );
+    }
+
+    #[test]
+    fn strong_builds_a_nested_inline_node() {
+        let blocks = parse_blocks("**strong**\n");
+        assert_eq!(
+            blocks[0].inlines,
+            vec![Inline::Strong(vec![Inline::Text("strong".to_string())])]
+        );
+    }
+
+    #[test]
+    fn strikethrough_builds_a_nested_inline_node() {
+        let blocks = parse_blocks("~~strike~~\n");
+        assert_eq!(
+            blocks[0].inlines,
+            vec![Inline::Strike(vec![Inline::Text("strike".to_string())])]
+        );
+    }
+
+    #[test]
+    fn inline_code_builds_a_code_node() {
+        let blocks = parse_blocks("`code`\n");
+        assert_eq!(blocks[0].inlines, vec![Inline::Code("code".to_string())]);
+    }
+
+    #[test]
+    fn link_builds_label_and_url() {
+        let blocks = parse_blocks("[label](http://x)\n");
+        assert_eq!(
+            blocks[0].inlines,
+            vec![Inline::Link {
+                label: vec![Inline::Text("label".to_string())],
+                url: "http://x".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn image_alt_flattens_nested_formatting() {
+        // Regression: alt text used to drop everything but bare Text/Code nodes, so
+        // "**bold**" inside an image's alt disappeared entirely.
+        let blocks = parse_blocks("![a **bold** b](img.png)\n");
+        assert_eq!(
+            blocks[0].inlines,
+            vec![Inline::Image {
+                alt: "a bold b".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn soft_break_separates_lines_within_a_paragraph() {
+        let blocks = parse_blocks("line one\nline two\n");
+        assert_eq!(
+            blocks[0].inlines,
+            vec![
+                Inline::Text("line one".to_string()),
+                Inline::SoftBreak,
+                Inline::Text("line two".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn hard_break_from_a_trailing_backslash() {
+        let blocks = parse_blocks("line one\\\nline two\n");
+        assert_eq!(
+            blocks[0].inlines,
+            vec![
+                Inline::Text("line one".to_string()),
+                Inline::HardBreak,
+                Inline::Text("line two".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_item_marker_and_flags() {
+        let blocks = parse_blocks("1. one\n2. two\n");
+        assert_eq!(
+            blocks[0].kind,
+            BlockKind::Item {
+                ordered: true,
+                marker: "1.".to_string(),
+                depth: 1,
+                task: None,
+            }
+        );
+        assert_eq!(
+            blocks[1].kind,
+            BlockKind::Item {
+                ordered: true,
+                marker: "2.".to_string(),
+                depth: 1,
+                task: None,
+            }
+        );
+    }
+
+    #[test]
+    fn task_list_items_carry_checked_state() {
+        let blocks = parse_blocks("- [ ] todo\n- [x] done\n");
+        assert_eq!(
+            blocks[0].kind,
+            BlockKind::Item {
+                ordered: false,
+                marker: "-".to_string(),
+                depth: 1,
+                task: Some(false),
+            }
+        );
+        assert_eq!(
+            blocks[1].kind,
+            BlockKind::Item {
+                ordered: false,
+                marker: "-".to_string(),
+                depth: 1,
+                task: Some(true),
+            }
+        );
+    }
+
+    #[test]
+    fn table_rows_carry_header_flag_and_cells() {
+        let blocks = parse_blocks("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        assert_eq!(
+            blocks[0].kind,
+            BlockKind::TableRow {
+                header: true,
+                cells: vec![
+                    vec![Inline::Text("a".to_string())],
+                    vec![Inline::Text("b".to_string())],
+                ],
+            }
+        );
+        assert_eq!(
+            blocks[1].kind,
+            BlockKind::TableRow {
+                header: false,
+                cells: vec![
+                    vec![Inline::Text("1".to_string())],
+                    vec![Inline::Text("2".to_string())],
+                ],
+            }
+        );
+    }
 }
