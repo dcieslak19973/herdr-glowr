@@ -134,9 +134,25 @@ pub fn focus(pane: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `pane close` argv for this pane, or `None` when not running inside a herdr pane
+/// (no non-empty `HERDR_PANE_ID`, e.g. a standalone or dev run).
+fn close_self_args(pane: Option<String>) -> Option<[String; 3]> {
+    let pane = pane.filter(|s| !s.is_empty())?;
+    Some(["pane".to_string(), "close".to_string(), pane])
+}
+
+/// Close this sidebar's own herdr pane on quit. Best-effort: a no-op outside herdr, and any
+/// error is swallowed since the process is already exiting.
+pub fn close_self() {
+    if let Some(args) = close_self_args(env::var("HERDR_PANE_ID").ok()) {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let _ = herdr(&refs);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Refusal, pane_id, parse_agents, pick_agent};
+    use super::{Refusal, close_self_args, pane_id, parse_agents, pick_agent};
     use serde_json::{Value, json};
 
     /// One agent entry shaped like the real `herdr agent list` output.
@@ -249,5 +265,15 @@ mod tests {
         let wrapped =
             json!({ "result": { "agents": [agent("w8:p1", "w8:t1", "w8")] } }).to_string();
         assert_eq!(parse_agents(&wrapped).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn close_self_args_needs_a_non_empty_pane_id() {
+        assert_eq!(
+            close_self_args(Some("p1".to_string())),
+            Some(["pane".to_string(), "close".to_string(), "p1".to_string()])
+        );
+        assert_eq!(close_self_args(Some(String::new())), None);
+        assert_eq!(close_self_args(None), None);
     }
 }

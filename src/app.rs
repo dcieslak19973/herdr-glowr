@@ -1378,6 +1378,11 @@ pub fn run_tui() -> Result<()> {
     let result = event_loop(&mut terminal, &mut app);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    // On a clean quit (q), close our own herdr pane instead of leaving a dead pane behind.
+    // Best-effort and a no-op outside herdr; an error exit leaves the pane so the message shows.
+    if result.is_ok() && app.should_quit {
+        crate::herdr::close_self();
+    }
     result
 }
 
