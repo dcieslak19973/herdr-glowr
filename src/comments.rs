@@ -183,8 +183,13 @@ impl Store {
     }
 
     /// Flip status, preserving unknown fields (read as `Value`, set `"status"`, tmp+rename).
-    /// `Ok(false)` when the id has no file.
+    /// `Ok(false)` when the id has no file, or isn't [`valid_id`] — an id straight off the
+    /// CLI/TUI is joined into a filename below, so a hostile id (`../../../evil`) must never
+    /// survive far enough to be joined into a path.
     pub fn set_status(&self, id: &str, status: Status) -> Result<bool, StoreError> {
+        if !valid_id(id) {
+            return Ok(false);
+        }
         let path = self.dir.join(format!("{id}.json"));
         let Ok(text) = std::fs::read_to_string(&path) else { return Ok(false) };
         let mut v: Value = serde_json::from_str(&text)
@@ -195,8 +200,11 @@ impl Store {
         Ok(true)
     }
 
-    /// `Ok(false)` when the id has no file.
+    /// `Ok(false)` when the id has no file, or isn't [`valid_id`] (see [`Self::set_status`]).
     pub fn remove(&self, id: &str) -> Result<bool, StoreError> {
+        if !valid_id(id) {
+            return Ok(false);
+        }
         let path = self.dir.join(format!("{id}.json"));
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(true),
@@ -402,6 +410,30 @@ mod tests {
         assert!(store.remove(&id).unwrap());
         assert!(!store.remove(&id).unwrap());
         assert!(!store.set_status("c-0-beef", Status::Resolved).unwrap());
+    }
+
+    #[test]
+    fn remove_and_set_status_reject_a_path_traversal_id_without_touching_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let comments_dir = dir.path().join("comments");
+        let store = Store::at(comments_dir.clone());
+        // A file one level above the comments dir — where a naive `../secret.json` join would
+        // land; a real id can never point outside `comments_dir`.
+        let secret = dir.path().join("secret.json");
+        std::fs::write(&secret, "keep me").unwrap();
+
+        assert!(
+            !store.remove("../secret").unwrap(),
+            "a path-traversal id is rejected, not acted on"
+        );
+        assert!(secret.exists(), "remove must never delete outside the comments dir");
+
+        assert!(!store.set_status("../secret", Status::Resolved).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "keep me",
+            "set_status must never write outside the comments dir either"
+        );
     }
 
     #[test]

@@ -290,19 +290,33 @@ impl App {
     /// `store` (as `Author::User`) immediately when `comment_sync` is `Immediate` (the
     /// default) and one is open — a persistence failure is logged and otherwise ignored,
     /// never lost from the in-memory view. Under `comment_sync: on-send` it stays
-    /// memory-only until `App::export` flushes it (`persist_open_user_comments`). Always
-    /// appended to `comments`. A no-op when the pane has no blocks to anchor to.
+    /// memory-only until `App::export` flushes it (`persist_open_user_comments`). When the
+    /// disk write succeeds, the in-memory `StoredComment` is minted under the *same* id
+    /// `Store::add` returned (`CommentStore::add_with_id`), not an independently-generated
+    /// one — two different ids for the same comment would leave `delete`/`resolve`/`export`
+    /// targeting a filename the store never wrote, silently no-oping instead of acting, or
+    /// duplicating the file. A no-op when the pane has no blocks to anchor to.
     pub fn add_comment(&mut self, pane: usize, text: String) {
         let Some((start, end, lines)) = self.anchor(pane) else { return };
         let file = self.docs[pane].path.clone().unwrap_or_default();
         let comment = Comment { file, start, end, lines, text };
+        let mut persisted_id = None;
         if self.comment_sync == CommentSync::Immediate
             && let Some(store) = &self.store
-            && let Err(e) = store.add(&comment, Author::User)
         {
-            logln!("app: failed to persist comment: {}", e.0);
+            match store.add(&comment, Author::User) {
+                Ok(id) => persisted_id = Some(id),
+                Err(e) => logln!("app: failed to persist comment: {}", e.0),
+            }
         }
-        self.comments.add(comment);
+        match persisted_id {
+            Some(id) => {
+                self.comments.add_with_id(id, comment);
+            }
+            None => {
+                self.comments.add(comment);
+            }
+        }
     }
 
     /// The doc pane index `focus` currently points at: `Focus::DocB` (Task 9's split mode)

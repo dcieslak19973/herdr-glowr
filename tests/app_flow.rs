@@ -7,6 +7,7 @@ use std::time::SystemTime;
 use herdr_glowr::app::{App, Focus, Mode};
 use herdr_glowr::comments::Store;
 use herdr_glowr::config::CommentSync;
+use herdr_glowr::export::Clipboard;
 use herdr_glowr::file_list::FileEntry;
 use herdr_glowr::{markdown, ui};
 use ratatui::crossterm::event::{
@@ -170,4 +171,43 @@ fn comment_sync_immediate_persists_new_comments_right_away() {
     assert_eq!(app.comments.open_user_comments().len(), 1);
     let written = std::fs::read_dir(dir.path().join("comments")).unwrap().count();
     assert_eq!(written, 1, "immediate sync writes the comment file right away");
+}
+
+#[test]
+fn add_comment_id_matches_disk_and_stays_matched_through_resolve_and_export() {
+    // Regression for the id-divergence bug: `Store::add` mints an id, writes `<id>.json`, and
+    // returns it; `add_comment` must record the in-memory `StoredComment` under that *same*
+    // id, not an independently-minted one — else `resolve`/`delete`/`export` target a
+    // filename the store never wrote (silently no-op via `Ok(false)`, or duplicate the file).
+    let dir = tempfile::tempdir().unwrap();
+    let comments_dir = dir.path().join("comments");
+    let mut app = App::for_test_with_path("# H\n\npara\n", Some("a.md"));
+    app.store = Some(Store::at(comments_dir.clone()));
+    app.docs[0].cursor_block = 1;
+    app.add_comment(0, "note".into());
+
+    // (a) exactly one file on disk, named after the in-memory comment's id.
+    let entries: Vec<_> = std::fs::read_dir(&comments_dir).unwrap().map(Result::unwrap).collect();
+    assert_eq!(entries.len(), 1, "add_comment must write exactly one file");
+    let sc = app.comments.get(0).expect("comment recorded in memory");
+    let path = comments_dir.join(format!("{}.json", sc.id));
+    assert!(path.exists(), "the in-memory id must name the file add_comment actually wrote");
+
+    // (b) resolving the comment through the app flips the on-disk status — only possible if
+    // `target_comment`'s id resolves to the file just asserted above.
+    app.resolve_selected_comment();
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(raw["status"], "resolved", "resolve must reach the same file add_comment wrote");
+
+    // Reopen it so it is still an open, user-authored comment `export` will send.
+    app.resolve_selected_comment();
+
+    // (c) exporting an already-persisted comment must not create a second file under a
+    // different id.
+    app.export(&Clipboard);
+    let entries_after: Vec<_> =
+        std::fs::read_dir(&comments_dir).unwrap().map(Result::unwrap).collect();
+    assert_eq!(entries_after.len(), 1, "export must not duplicate an already-persisted comment");
+    assert!(path.exists(), "the original file is still the one on disk");
 }

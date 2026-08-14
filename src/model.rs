@@ -70,8 +70,17 @@ impl CommentStore {
     /// metadata (a new id, `Author::User`, `Status::Open`) — every comment a reviewer writes
     /// starts here. Returns its index.
     pub fn add(&mut self, comment: Comment) -> usize {
+        self.add_with_id(new_id(), comment)
+    }
+
+    /// As [`Self::add`], but under the given `id` instead of minting a fresh one — for a
+    /// comment that was already persisted to disk under `id` (`Store::add`'s return value),
+    /// so the in-memory and on-disk ids never diverge (`App::add_comment`): two independently
+    /// minted ids would leave `delete`/`resolve`/`export` targeting a filename the store
+    /// never wrote, silently no-oping or duplicating the file.
+    pub fn add_with_id(&mut self, id: String, comment: Comment) -> usize {
         self.items.push(StoredComment {
-            id: new_id(),
+            id,
             author: Author::User,
             status: Status::Open,
             created_at: now_iso(),
