@@ -142,7 +142,14 @@ pub fn doc_viewport_height(area: Rect, list_pct: u16) -> usize {
 /// plus any spliced comment-card lines when the row is the last one of a block that has a
 /// comment. Shares `layout_rows` and `comment_cards` with [`render_doc_view`], so what this
 /// measures is exactly what gets painted — scroll-clamping and hit-testing can't desync from
-/// the card splice.
+/// the card splice, **in `Mode::Browse`**.
+///
+/// This does *not* account for an open inline composer: while `render_doc_view` is composing
+/// on this pane, it replaces the scrolled window with a fixed above/box/below split anchored
+/// to the selected block (see its "Composing:" branch), which these row heights don't model.
+/// Callers (Task 9's click hit-testing) must not route through `hit_doc`/`doc_row_heights`
+/// while `app.mode` is `Mode::Composing` for the doc's pane — the composer has no click
+/// target of its own yet.
 pub fn doc_row_heights(app: &App, area: Rect) -> Vec<usize> {
     let width = inner_rect(panes(area, app.list_pct).doc).width as usize;
     let p = &app.palette;
