@@ -9,7 +9,7 @@
 //! persisted through.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
@@ -50,6 +50,10 @@ pub struct DocPane {
     /// ([`crate::markdown::line_index`]), cached at load so [`App::anchor`] never
     /// re-scans the source.
     pub line_starts: Vec<usize>,
+    /// Last-modified time of the backing file when this pane was loaded, or `None` for a
+    /// test-built or unopened pane. The poll tick compares the current on-disk mtime against
+    /// this to reload the pane in place when an agent (or anything) rewrites the open file.
+    pub mtime: Option<SystemTime>,
 }
 
 /// Which pane currently has keyboard focus.
@@ -562,9 +566,11 @@ impl App {
     /// Read `path` (repo-relative) from disk, lossily as UTF-8 — empty when unreadable —
     /// render it, and replace `docs[pane]` with the freshly loaded pane.
     fn load_pane(&mut self, pane: usize, path: &str) {
-        let content = std::fs::read(self.repo.join(path))
+        let full = self.repo.join(path);
+        let content = std::fs::read(&full)
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default();
+        let mtime = std::fs::metadata(&full).and_then(|m| m.modified()).ok();
         let doc = markdown::render_document(&content, &self.palette, &self.highlighter);
         let line_starts = markdown::line_index(&content);
         self.docs[pane] = DocPane {
@@ -574,6 +580,7 @@ impl App {
             sel_anchor: None,
             scroll: 0,
             line_starts,
+            mtime,
         };
     }
 
@@ -1129,6 +1136,43 @@ impl App {
             .min(self.files.len().saturating_sub(1));
     }
 
+    /// Reload any open doc pane whose backing file's on-disk mtime has moved since it was
+    /// loaded — an agent (or an external editor) rewriting the displayed file shows up on the
+    /// next poll tick without the reviewer reopening it. Best-effort: a stat failure (file
+    /// gone, transiently unreadable) leaves the pane untouched, and the block cursor/selection
+    /// are clamped to the reloaded document rather than reset, so the reading position is kept.
+    fn reload_changed_docs(&mut self) {
+        for pane in 0..self.docs.len() {
+            let Some(path) = self.docs[pane].path.clone() else { continue };
+            let Ok(mtime) = std::fs::metadata(self.repo.join(&path)).and_then(|m| m.modified())
+            else {
+                continue;
+            };
+            if self.docs[pane].mtime == Some(mtime) {
+                continue;
+            }
+            self.reload_pane(pane, &path, mtime);
+        }
+    }
+
+    /// Re-read and re-render `docs[pane]` from `path`, preserving the block cursor and any
+    /// selection anchor clamped to the reloaded document's block count. `mtime` is the freshly
+    /// observed modified time recorded so the next tick only reloads on a further change.
+    fn reload_pane(&mut self, pane: usize, path: &str, mtime: SystemTime) {
+        let content = std::fs::read(self.repo.join(path))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        let doc = markdown::render_document(&content, &self.palette, &self.highlighter);
+        let line_starts = markdown::line_index(&content);
+        let last = doc.blocks.len().saturating_sub(1);
+        let cur = &mut self.docs[pane];
+        cur.cursor_block = cur.cursor_block.min(last);
+        cur.sel_anchor = cur.sel_anchor.map(|a| a.min(last));
+        cur.doc = doc;
+        cur.line_starts = line_starts;
+        cur.mtime = Some(mtime);
+    }
+
     // ---- input dispatch --------------------------------------------------------------
 
     /// Handle one key press. `area` is the terminal frame's rect — used only for
@@ -1405,6 +1449,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if last_poll.elapsed() >= POLL {
             app.check_comment_store();
             app.refresh_files();
+            app.reload_changed_docs();
             last_poll = Instant::now();
         }
     }
@@ -1436,6 +1481,7 @@ impl App {
             sel_anchor: None,
             scroll: 0,
             line_starts,
+            mtime: None,
         };
         App {
             docs: [pane, DocPane::default()],
@@ -1465,6 +1511,7 @@ impl App {
             sel_anchor: None,
             scroll: 0,
             line_starts,
+            mtime: None,
         };
     }
 
@@ -1498,5 +1545,32 @@ mod tests {
         app.docs[0].cursor_block = 1;
         app.add_comment(0, "note".into());
         assert_eq!(app.comments.open_user_comments().len(), 1);
+    }
+
+    #[test]
+    fn reload_changed_docs_repicks_up_disk_edits_and_gates_on_mtime() {
+        use std::time::SystemTime;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("doc.md"), "# A\n\none\n\ntwo\n\nthree\n").unwrap();
+        let mut app = App::for_test("");
+        app.repo = dir.path().to_path_buf();
+        app.load_pane(0, "doc.md");
+        assert_eq!(app.docs[0].doc.source, "# A\n\none\n\ntwo\n\nthree\n");
+        assert!(app.docs[0].mtime.is_some());
+        app.docs[0].cursor_block = 3; // last block ("three")
+
+        // Unchanged mtime: reload is a no-op even though we scribble over the in-memory doc.
+        app.docs[0].doc.source = "STALE".into();
+        app.reload_changed_docs();
+        assert_eq!(app.docs[0].doc.source, "STALE");
+
+        // Rewrite on disk with fewer blocks; force a differing mtime so the tick reloads.
+        std::fs::write(dir.path().join("doc.md"), "# B\n").unwrap();
+        app.docs[0].mtime = Some(SystemTime::UNIX_EPOCH);
+        app.reload_changed_docs();
+        assert_eq!(app.docs[0].doc.source, "# B\n");
+        // Cursor clamped to the reloaded (single-block) document, not left dangling at 3.
+        assert_eq!(app.docs[0].cursor_block, 0);
     }
 }
