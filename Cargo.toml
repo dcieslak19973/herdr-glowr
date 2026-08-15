@@ -1,6 +1,6 @@
 [package]
 name = "herdr-glowr"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.90"
 description = "A herdr-native markdown viewer: browse a document and send comments back to chat, in the terminal."
